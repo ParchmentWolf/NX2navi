@@ -42,6 +42,32 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_TITLE] = "Settings",
     [UI_MENU_TAB_SCREEN] = "Screen", [UI_MENU_TAB_GAME] = "Game", [UI_MENU_TAB_MODS] = "Mods", [UI_MENU_TAB_SOUND] = "Sound",
     [UI_MENU_TAB_CONTROLS] = "Controls", [UI_MENU_TAB_AMIIBO] = "Amiibo", [UI_MENU_TAB_MENU] = "Menu", [UI_MENU_TAB_ADVANCED] = "Advanced",
+    [UI_MENU_TAB_VR] = "VR",
+    [UI_MENU_VR] = "VR", [UI_MENU_VR_DESC] = "Shows the game in a VR headset through OpenXR (for example WiVRn on Linux, with "
+        "the headset connected before the game starts). Applies after a restart.",
+    [UI_MENU_VR_GROUP_VIEW] = "View", [UI_MENU_VR_GROUP_EYES] = "Eye position", [UI_MENU_VR_GROUP_HUD] = "HUD",
+    [UI_MENU_VR_VIEW] = "View", [UI_MENU_VR_VIEW_SCREEN] = "Screen", [UI_MENU_VR_VIEW_HEAD] = "Head tracked",
+    [UI_MENU_VR_VIEW_DESC] = "Head tracked: the game's camera follows your head and the world surrounds you. Screen: the game "
+        "on a large screen floating in front of you. Cutscenes and this menu always show on the screen.",
+    [UI_MENU_VR_CAMERA] = "Camera", [UI_MENU_VR_CAMERA_FIRST] = "First person", [UI_MENU_VR_CAMERA_THIRD] = "Third person",
+    [UI_MENU_VR_CAMERA_DESC] = "First person: you see from Link's eyes, Link is hidden while what he holds stays in view, and he faces where you "
+        "look while he stands. "
+        "Third person: the game's own camera, turned by your head.",
+    [UI_MENU_VR_EYE_UP] = "Height", [UI_MENU_VR_EYE_UP_DESC] = "Moves your eyes up or down from the height of Link's eyes, in "
+        "centimetres.",
+    [UI_MENU_VR_EYE_SIDE] = "Left and right", [UI_MENU_VR_EYE_SIDE_DESC] = "Moves your eyes to Link's right (more) or left "
+        "(less), in centimetres.",
+    [UI_MENU_VR_EYE_FORWARD] = "Forward", [UI_MENU_VR_EYE_FORWARD_DESC] = "Moves your eyes forward or back from Link's face, "
+        "in centimetres.",
+    [UI_MENU_VR_HUD] = "HUD", [UI_MENU_VR_HUD_PANEL] = "Panel in front of you", [UI_MENU_VR_HUD_PICTURE] = "In the picture",
+    [UI_MENU_VR_HUD_DESC] = "Panel in front of you: the hearts, buttons and map float on a panel that moves with your head, "
+        "and the world is shown without them. In the picture: the HUD stays drawn over the world.",
+    [UI_MENU_VR_HUD_SIZE] = "HUD size", [UI_MENU_VR_HUD_SIZE_DESC] = "The width of the HUD's panel, a metre in front of you.",
+    [UI_MENU_VR_SCALE] = "Field of view",
+    [UI_MENU_VR_SCALE_DESC] = "How much of the world the view takes in. 100% matches the headset's lenses exactly; the default, "
+        "130%, makes the world feel closer to its size on a screen. Higher fits more of the world into your view, so "
+        "everything looks smaller; lower zooms in. Far from 100%, the world can seem to move "
+        "a little as you turn your head.",
     [UI_MENU_CONTINUE] = "Continue", [UI_MENU_QUIT] = "Quit game",
     [UI_MENU_ON] = "On", [UI_MENU_OFF] = "Off", [UI_MENU_AUTO] = "Automatic", [UI_MENU_DEFAULT_MARK] = "default",
     [UI_MENU_AFTER_RESTART] = "after restart", [UI_MENU_SET_BY_ENV] = "set by environment variable",

@@ -101,7 +101,7 @@ static int first_person_eye(double eye[3]) {
     return 1;
 }
 
-// First person's turn of Link toward the view (NX2NAVI_VR_TURN=look), while he stands upright (not climbing, swimming
+// First person's turn of Link toward the view, while he stands upright (not climbing, swimming
 // or hanging), so what he holds and what reacts to his facing follow the head. His facing as the game keeps it, from
 // which his rotation, his physics and the rest are made each frame: the object component 0 points at (+0x60), its 3x4
 // matrix by rows at +0x1f8 (the position in each row's fourth float). Its rotation is made the turn about the vertical
@@ -118,7 +118,7 @@ static void turn_link(const double ahead[3]) {
     const float dx = feet[0] - last[0], dz = feet[2] - last[2];
     const int standing = have_last && dx * dx + dz * dz < 0.004f * 0.004f;
     memcpy(last, feet, sizeof last), have_last = 1;
-    if (!standing || strcmp(cfg_value("NX2NAVI_VR_TURN"), "look") || strcmp(cfg_value("NX2NAVI_VR_CAMERA"), "first")) return;
+    if (!standing || strcmp(cfg_value("NX2NAVI_VR_CAMERA"), "first")) return;
     const double n = sqrt(ahead[0] * ahead[0] + ahead[2] * ahead[2]);
     if (!(n > 1e-4)) return;
     const float s = (float)(ahead[0] / n), c = (float)(ahead[2] / n);

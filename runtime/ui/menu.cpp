@@ -583,7 +583,7 @@ extern "C" void menu_vk_release(void) {
 // NX2NAVI_ prefix optional) puts the cursor on that setting's row and scrolls it into view when the row is next drawn
 // (opt_focus_key), so a page's shot shows a row below the first screenful; it does not switch tabs.
 // Ocarina of Time: the options this port has
-enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_COUNT };
+enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_VR, TAB_COUNT };
 enum { TEST_PAGE_FRAMES = 30, TEST_SETS = 16, TEST_OPENS = 8 };
 struct TestSet { uint64_t frame; char key[64], value[64]; };
 static struct {
@@ -1793,8 +1793,29 @@ static void rows_low_end(void) {
 #endif
 }
 
+// VR (vk_xr.cpp, vr_game.c): the headset at the next start, then how the view, the eyes and the HUD are placed
+static void tab_vr(float scale) {
+    opt_begin("##vr", scale);
+    opt_toggle("NX2NAVI_VR", UI_MENU_VR, UI_MENU_VR_DESC);
+    opt_group(UI_MENU_VR_GROUP_VIEW);
+    static const UiTextId views[] = {UI_MENU_VR_VIEW_SCREEN, UI_MENU_VR_VIEW_HEAD};
+    opt_choice("NX2NAVI_VR_VIEW", UI_MENU_VR_VIEW, views, 2, UI_MENU_VR_VIEW_DESC);
+    static const UiTextId cameras[] = {UI_MENU_VR_CAMERA_FIRST, UI_MENU_VR_CAMERA_THIRD};
+    opt_choice("NX2NAVI_VR_CAMERA", UI_MENU_VR_CAMERA, cameras, 2, UI_MENU_VR_CAMERA_DESC);
+    opt_slider("NX2NAVI_VR_VIEW_SCALE", UI_MENU_VR_SCALE, 50, 200, UI_MENU_VR_SCALE_DESC, 5, "%.0f %%");
+    opt_group(UI_MENU_VR_GROUP_EYES);
+    opt_slider("NX2NAVI_VR_EYE_UP", UI_MENU_VR_EYE_UP, -30, 30, UI_MENU_VR_EYE_UP_DESC, 1, "%+.0f cm");
+    opt_slider("NX2NAVI_VR_EYE_SIDE", UI_MENU_VR_EYE_SIDE, -30, 30, UI_MENU_VR_EYE_SIDE_DESC, 1, "%+.0f cm");
+    opt_slider("NX2NAVI_VR_EYE_FORWARD", UI_MENU_VR_EYE_FORWARD, -30, 30, UI_MENU_VR_EYE_FORWARD_DESC, 1, "%+.0f cm");
+    opt_group(UI_MENU_VR_GROUP_HUD);
+    static const UiTextId huds[] = {UI_MENU_VR_HUD_PANEL, UI_MENU_VR_HUD_PICTURE};
+    opt_choice("NX2NAVI_VR_HUD", UI_MENU_VR_HUD, huds, 2, UI_MENU_VR_HUD_DESC);
+    opt_slider("NX2NAVI_VR_HUD_SIZE", UI_MENU_VR_HUD_SIZE, 40, 200, UI_MENU_VR_HUD_SIZE_DESC, 5, "%.0f cm");
+    opt_end();
+}
+
 static const UiTextId kTabNames[TAB_COUNT] = {UI_MENU_TAB_SCREEN, UI_MENU_TAB_GAME, UI_MENU_TAB_SOUND,
-                                              UI_MENU_TAB_CONTROLS};
+                                              UI_MENU_TAB_CONTROLS, UI_MENU_TAB_VR};
 static int g_tab;               // the tab shown
 static int g_tab_request = -1;  // select this tab at the next layout; -1 none
 static int g_focus_page = -1;   // this tab's first row takes the cursor once it is shown; -1 none
@@ -1915,6 +1936,7 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
             case TAB_GAME: tab_game(scale); break;
             case TAB_SOUND: tab_sound(scale); break;
             case TAB_CONTROLS: tab_controls(scale); break;
+            case TAB_VR: tab_vr(scale); break;
             }
             ImGui::EndTabItem();
         }

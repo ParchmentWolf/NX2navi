@@ -108,6 +108,7 @@ struct Xr {
     std::mutex frame_mu;
     bool frame_on = false;
     Drawn drawn;
+    float render_scale = 1.0f;   // the lens the game draws with over the one shown (NX2NAVI_VR_VIEW_SCALE)
     std::atomic<uint32_t> camera_given{0}, lens_given{0}, tracked_pictures{0};
     // the gameplay camera's updates since the last picture, and the pictures in a row with none: a paused game (the
     // inventory) draws flat pictures while the camera stands still, and those go on the screen
@@ -888,6 +889,9 @@ extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3]) {
     std::lock_guard<std::mutex> lk(x.frame_mu);
     x.frame_on = true;
     x.drawn.tracked = true, x.drawn.pose = head, x.drawn.lens = frustum(eyes, x.picture_ratio.load());
+    // the game draws a lens this many times the one the headset is told (NX2NAVI_VR_VIEW_SCALE, 130 % by default: the
+    // world as large as it feels on a screen): more of the world in the same view, everything smaller above 100 %
+    x.render_scale = std::fmax(0.5f, std::fmin(2.0f, (float)cfg_int("NX2NAVI_VR_VIEW_SCALE") / 100.0f));
     x.camera_given++;
     x.updates++;
     return 1;
@@ -897,7 +901,7 @@ extern "C" int vk_xr_lens(float *angle) {
     Xr &x = xr();
     std::lock_guard<std::mutex> lk(x.frame_mu);
     if (!x.frame_on) return 0;
-    *angle = 2.0f * std::atan(x.drawn.lens.u);
+    *angle = 2.0f * std::atan(x.drawn.lens.u * x.render_scale);
     x.lens_given++;
     return 1;
 }
