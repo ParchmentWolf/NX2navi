@@ -1,5 +1,6 @@
 // The debug menu's access to the game (debug_tools.c). Everything but dbg_tick is for the menu's thread.
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
 
 #ifndef __cplusplus
@@ -21,6 +22,9 @@ int dbg_area(char out[64]);            // the area the game is in, by its name i
 // Every 64-character text of the game data (the area among them) with the hash of its name; returns their number.
 int dbg_texts(void (*cb)(uint32_t hash, const char *text, void *ctx), void *ctx);
 uint32_t dbg_name_hash(const char *name);   // the hash the game knows a flag or a text by
+int dbg_flag_get(const char *name, int *on);   // an on/off flag of the game data now; 0 when there is no such flag
+uint64_t dbg_player_actor(void);       // Link's actor; 0 while there is no player
+int dbg_poke(uint64_t addr, const void *from, size_t n);   // a write into the game's read-write memory; 0 elsewhere
 float dbg_speed_factor(void);          // the game's speed: 1 normal, 0.05 to 8 (frame_rate.c multiplies the game's step)
 void dbg_speed_set(float factor);
 

@@ -86,6 +86,8 @@ static const char *const known[] = {
     "MEM_BUDGET_TEST_VRAM_MB", "MEM_BUDGET_TEST_RAM_MB",
     "TEX_COMPACT", "TEX_COMPACT_MIN_MB", "TEX_COMPACT_FRAME_MB",   // texture compaction (vk_texture.c); no menu row
     "STANDIN_FILTER",   // the filter of the scene upscaler's stand-in (vk_tonemap.c); no menu row
+    "VR", "VR_SCREEN", "VR_VIEW", "VR_CAMERA", "VR_EYE_UP", "VR_EYE_SIDE", "VR_EYE_FORWARD",
+    "PATCH_VR_LENS",   // VR through OpenXR (vk_xr.cpp, vr_game.c)
     // retired: the settings of the co-op of versions up to 0.9.2; read by nothing, listed so that a file which still
     // sets them logs no unknown key
     "COOP", "COOP_BETA", "COOP_NAME", "COOP_SERVER", "COOP_PORT", "COOP_ROOM", "COOP_AUTO", "COOP_DROP",
@@ -170,6 +172,8 @@ static const struct { const char *key, *section; } sections[] = {
     {"VMA_BLOCK_MB", "diagnostics"}, {"DEVICE_LOST_AT", "diagnostics"}, {"STAGING_FAIL_AT", "diagnostics"}, {"VRAM_BALLAST_MB", "diagnostics"},
     {"MEM_BUDGET_TEST_VRAM_MB", "diagnostics"}, {"MEM_BUDGET_TEST_RAM_MB", "diagnostics"},
     {"TEX_COMPACT", "performance"}, {"TEX_COMPACT_MIN_MB", "performance"}, {"TEX_COMPACT_FRAME_MB", "performance"},
+    {"VR", "vr"}, {"VR_SCREEN", "vr"}, {"VR_VIEW", "vr"}, {"VR_CAMERA", "vr"}, {"VR_EYE_UP", "vr"}, {"VR_EYE_SIDE", "vr"},
+    {"VR_EYE_FORWARD", "vr"},
 };
 
 // The settings the menu shows: the value in effect when the key is unset, and what the key accepts. The only place a
@@ -193,6 +197,12 @@ static const CfgMeta metas[] = {
     {"VK_PRESENT", "mailbox", "mailbox|fifo|immediate", LIVE}, {"GPU_INDEX", "", NULL, RESTART},
     // vk_lowlat.c level_now: the driver's low latency without frame generation (0 off, 1 on, 2 on with boost)
     {"LOW_LATENCY", "0", "0|1|2", LIVE},
+    // vk_xr.cpp: VR through OpenXR, the screen's width and distance in metres, and the view: the game's camera following
+    // the headset (head) or the picture on the screen (screen)
+    {"VR", "0", "0|1", RESTART}, {"VR_SCREEN", "3.2,2.5", NULL, RESTART}, {"VR_VIEW", "head", "screen|head", LIVE},
+    // vr_game.c: the head's view from Link's eyes (first) or the game's camera (third), and the eyes' offsets in cm
+    {"VR_CAMERA", "first", "first|third", LIVE}, {"VR_EYE_UP", "0", "-30..30", LIVE}, {"VR_EYE_SIDE", "0", "-30..30", LIVE},
+    {"VR_EYE_FORWARD", "0", "-30..30", LIVE},
     {"MONITOR", "auto", NULL, RESTART},   // auto|primary|<1-based index>|<part of a monitor name> (gfx_window_win.c, gfx_window_sdl.c chosen_monitor)
     {"PERF_OVERLAY", "off", "off|fps|full", LIVE},
     {"OUTPUT_RES", "1920x1080", NULL, RESTART}, {"RENDER_SCALE", "game", "game|50|67|75|100|125|150|200", RESTART},
