@@ -34,6 +34,7 @@ extern "C" {
 #include "ui/menu.h"
 #include "vk_xr.h"
 #include "vr_game.h"
+#include "xr_hud_spv.h"
 }
 
 namespace {
@@ -58,6 +59,7 @@ struct Pose {
 // shown on the screen
 struct Drawn {
     bool tracked = false;
+    bool hud = false;   // the HUD apart: the box holds the scene without it, the HUD box its panel
     Pose pose;
     Lens lens;
 };
@@ -111,6 +113,25 @@ struct Xr {
     // inventory) draws flat pictures while the camera stands still, and those go on the screen
     std::atomic<uint32_t> updates{0};
     int stale = 0;   // the present's thread alone
+    // the HUD's panel (NX2NAVI_VR_HUD=panel). The game draws its HUD over its upscaled scene in one float target; the
+    // scene as the upscaler left it is kept (vk_xr_scene_image, the replay's stream), and at the present, when the
+    // target holds the HUD too, shaders/xr_hud.comp makes the scene without the HUD and the HUD's panel from the two
+    std::mutex hud_mu;
+    VkImage hud_target = VK_NULL_HANDLE, scene = VK_NULL_HANDLE, scene8 = VK_NULL_HANDLE, panel8 = VK_NULL_HANDLE;
+    VkImageView target_view = VK_NULL_HANDLE, scene_view = VK_NULL_HANDLE, scene8_view = VK_NULL_HANDLE, panel8_view = VK_NULL_HANDLE;
+    VkImage target_viewed = VK_NULL_HANDLE;   // the target target_view is of
+    uint32_t hud_w = 0, hud_h = 0;
+    VkFormat hud_format = VK_FORMAT_UNDEFINED;
+    uint64_t kept = 0, used = 0;   // scenes kept, and the last one a panel was made from
+    VkDescriptorSetLayout hud_set = VK_NULL_HANDLE;
+    VkPipelineLayout hud_layout = VK_NULL_HANDLE;
+    VkPipeline hud_pipe = VK_NULL_HANDLE;
+    VkSampler nearest = VK_NULL_HANDLE;
+    PFN_vkCmdPushDescriptorSetKHR push_set = nullptr;
+    bool hud_tried = false;
+    VkImage hud_boxes[3]{};
+    std::atomic<uint32_t> panels{0};
+    std::atomic<uint32_t> pic_w{0}, pic_h{0};   // the game's presented picture's size: the HUD's target is the scene upscaled to it
 };
 
 Xr &xr() {
@@ -284,7 +305,8 @@ bool make_boxes(VkFormat window) {
     }
     VkPhysicalDeviceMemoryProperties mem;
     vkGetPhysicalDeviceMemoryProperties(x.phys, &mem);
-    for (VkImage &box : x.boxes) {
+    for (int k = 0; k < 6; k++) {   // the pictures' three, then the HUD's
+        VkImage &box = k < 3 ? x.boxes[k] : x.hud_boxes[k - 3];
         VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ci.imageType = VK_IMAGE_TYPE_2D;
         ci.format = format;
@@ -308,6 +330,119 @@ bool make_boxes(VkFormat window) {
             return false;
     }
     rt_log("vr: VR's pictures: %ux%u, format %d (the window's %d)", x.width, x.height, (int)format, (int)window);
+    return true;
+}
+
+// A device-local 2D image (one level, one layer) and a view of it; UNDEFINED until the caller's barrier
+bool make_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage, VkImage &image, VkImageView &view) {
+    Xr &x = xr();
+    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ci.imageType = VK_IMAGE_TYPE_2D, ci.format = format, ci.extent = {w, h, 1};
+    ci.mipLevels = ci.arrayLayers = 1, ci.samples = VK_SAMPLE_COUNT_1_BIT, ci.tiling = VK_IMAGE_TILING_OPTIMAL, ci.usage = usage;
+    if (vkCreateImage(x.device, &ci, nullptr, &image) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr;
+    vkGetImageMemoryRequirements(x.device, image, &mr);
+    VkPhysicalDeviceMemoryProperties mem;
+    vkGetPhysicalDeviceMemoryProperties(x.phys, &mem);
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < mem.memoryTypeCount && type == UINT32_MAX; i++)
+        if ((mr.memoryTypeBits & (1u << i)) && (mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) type = i;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size, ai.memoryTypeIndex = type;
+    VkDeviceMemory dm = VK_NULL_HANDLE;
+    if (type == UINT32_MAX || vkAllocateMemory(x.device, &ai, nullptr, &dm) != VK_SUCCESS ||
+        vkBindImageMemory(x.device, image, dm, 0) != VK_SUCCESS)
+        return false;
+    VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vc.image = image, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = format, vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    return vkCreateImageView(x.device, &vc, nullptr, &view) == VK_SUCCESS;
+}
+
+// The HUD panel's shader (shaders/xr_hud.comp): two sampled float images in, two RGBA8 storage images out, push descriptors
+bool make_hud_pipeline() {
+    Xr &x = xr();
+    x.push_set = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(x.device, "vkCmdPushDescriptorSetKHR");
+    if (!x.push_set) return false;
+    VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    si.magFilter = si.minFilter = VK_FILTER_NEAREST;
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (vkCreateSampler(x.device, &si, nullptr, &x.nearest) != VK_SUCCESS) return false;
+    const VkDescriptorSetLayoutBinding b[4] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                               {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                               {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                               {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+    VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 4, li.pBindings = b;
+    if (vkCreateDescriptorSetLayout(x.device, &li, nullptr, &x.hud_set) != VK_SUCCESS) return false;
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(int32_t) * 2};
+    VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pi.setLayoutCount = 1, pi.pSetLayouts = &x.hud_set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
+    if (vkCreatePipelineLayout(x.device, &pi, nullptr, &x.hud_layout) != VK_SUCCESS) return false;
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = sizeof xr_hud_spv, mi.pCode = xr_hud_spv;
+    VkShaderModule m = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(x.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", nullptr};
+    ci.layout = x.hud_layout;
+    const VkResult r = vkCreateComputePipelines(x.device, VK_NULL_HANDLE, 1, &ci, nullptr, &x.hud_pipe);
+    vkDestroyShaderModule(x.device, m, nullptr);
+    return r == VK_SUCCESS;
+}
+
+bool hud_wanted() { return strcmp(cfg_value("NX2NAVI_VR_HUD"), "panel") == 0; }
+
+// (vk_xr_capture, hud_mu held) the scene without the HUD and the HUD's panel made from the target as it is now and the
+// scene kept from before the HUD; false when there is nothing new to make them from
+bool make_panel(VkCommandBuffer cb) {
+    Xr &x = xr();
+    if (!x.scene || !x.hud_target || x.kept == x.used) return false;
+    if (!x.hud_tried) {
+        x.hud_tried = true;
+        if (!make_hud_pipeline()) {
+            rt_log("vr: the HUD panel's shader could not be made: the HUD stays in the picture");
+            x.hud_pipe = VK_NULL_HANDLE;
+        }
+    }
+    if (!x.hud_pipe) return false;
+    if (!x.scene8) {
+        const VkImageUsageFlags u = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        if (!make_image(x.hud_w, x.hud_h, VK_FORMAT_R8G8B8A8_UNORM, u, x.scene8, x.scene8_view) ||
+            !make_image(x.hud_w, x.hud_h, VK_FORMAT_R8G8B8A8_UNORM, u, x.panel8, x.panel8_view)) {
+            x.hud_pipe = VK_NULL_HANDLE;
+            return false;
+        }
+        rt_log("vr: the HUD panel: the HUD's target %ux%u (format %d)", x.hud_w, x.hud_h, (int)x.hud_format);
+    }
+    if (x.target_viewed != x.hud_target) {   // a view of the game's target, made again when the target is another
+        if (x.target_view) vkDestroyImageView(x.device, x.target_view, nullptr);
+        VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vc.image = x.hud_target, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = x.hud_format;
+        vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        x.target_view = VK_NULL_HANDLE;
+        if (vkCreateImageView(x.device, &vc, nullptr, &x.target_view) != VK_SUCCESS) return false;
+        x.target_viewed = x.hud_target;
+    }
+    x.used = x.kept;
+    barrier(cb, x.scene8, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    barrier(cb, x.panel8, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.hud_pipe);
+    const VkDescriptorImageInfo info[4] = {{x.nearest, x.target_view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {x.nearest, x.scene_view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, x.scene8_view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, x.panel8_view, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet w[4]{};
+    for (uint32_t i = 0; i < 4; i++) {
+        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, w[i].dstBinding = i, w[i].descriptorCount = 1;
+        w[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w[i].pImageInfo = &info[i];
+    }
+    x.push_set(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.hud_layout, 0, 4, w);
+    const int32_t pc[2] = {(int32_t)x.hud_w, (int32_t)x.hud_h};
+    vkCmdPushConstants(cb, x.hud_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    vkCmdDispatch(cb, (x.hud_w + 7) / 8, (x.hud_h + 7) / 8, 1);
+    barrier(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    x.panels++;
     return true;
 }
 
@@ -351,8 +486,9 @@ void run(void *) {
     }
     x.rgba.store(format == VK_FORMAT_R8G8B8A8_SRGB);
 
-    XrSwapchain swapchain = XR_NULL_HANDLE;
-    std::vector<XrSwapchainImageVulkanKHR> images;
+    XrSwapchain swapchain = XR_NULL_HANDLE, hud_swapchain = XR_NULL_HANDLE;   // (the HUD's panel's own)
+    std::vector<XrSwapchainImageVulkanKHR> images, hud_images;
+    bool hud_has = false;
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cb = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
@@ -377,6 +513,15 @@ void run(void *) {
         x.xrEnumerateSwapchainImages(swapchain, 0, &n, nullptr);
         images.assign(n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
         x.xrEnumerateSwapchainImages(swapchain, n, &n, (XrSwapchainImageBaseHeader *)images.data());
+        if (XR_SUCCEEDED(x.xrCreateSwapchain(session, &sw, &hud_swapchain))) {
+            uint32_t hn = 0;
+            x.xrEnumerateSwapchainImages(hud_swapchain, 0, &hn, nullptr);
+            hud_images.assign(hn, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+            x.xrEnumerateSwapchainImages(hud_swapchain, hn, &hn, (XrSwapchainImageBaseHeader *)hud_images.data());
+        } else {
+            hud_swapchain = XR_NULL_HANDLE;
+            rt_log("vr: no swapchain for the HUD's panel: the HUD stays in the picture");
+        }
         VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pi.queueFamilyIndex = x.family;
         vkCreateCommandPool(x.device, &pi, nullptr, &pool);
@@ -474,6 +619,41 @@ void run(void *) {
             if (x.latest >= 0 && x.box_value[x.latest] > shown)
                 slot = x.latest, value = x.box_value[slot], drawn = x.box_drawn[slot], x.reading = slot;
         }
+        // a box into the next image of a swapchain on VR's queue, after the present that wrote it (its timeline value)
+        const auto copy_into = [&](XrSwapchain target, std::vector<XrSwapchainImageVulkanKHR> &imgs, VkImage from) -> bool {
+            uint32_t index = 0;
+            XrSwapchainImageAcquireInfo acq{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+            XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+            wait.timeout = XR_INFINITE_DURATION;
+            if (XR_FAILED(x.xrAcquireSwapchainImage(target, &acq, &index)) || XR_FAILED(x.xrWaitSwapchainImage(target, &wait)))
+                return false;
+            const VkImage dst = imgs[index].image;
+            vkResetCommandPool(x.device, pool, 0);
+            VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkBeginCommandBuffer(cb, &bi);
+            barrier(cb, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VkImageCopy c{};
+            c.srcSubresource = c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            c.extent = {x.width, x.height, 1};
+            vkCmdCopyImage(cb, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+            barrier(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            vkEndCommandBuffer(cb);
+            VkSemaphoreSubmitInfo w{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+            w.semaphore = x.timeline, w.value = value, w.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            VkCommandBufferSubmitInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+            cbi.commandBuffer = cb;
+            VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+            si.waitSemaphoreInfoCount = 1, si.pWaitSemaphoreInfos = &w;
+            si.commandBufferInfoCount = 1, si.pCommandBufferInfos = &cbi;
+            vkQueueSubmit2(x.queue, 1, &si, fence);
+            XrSwapchainImageReleaseInfo rel{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            x.xrReleaseSwapchainImage(target, &rel);
+            vkWaitForFences(x.device, 1, &fence, VK_TRUE, UINT64_MAX);
+            vkResetFences(x.device, 1, &fence);
+            return true;
+        };
+        if (slot >= 0 && drawn.hud && hud_swapchain) hud_has = copy_into(hud_swapchain, hud_images, x.hud_boxes[slot]);
         if (slot >= 0) {
             uint32_t index = 0;
             XrSwapchainImageAcquireInfo acq{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
@@ -539,21 +719,36 @@ void run(void *) {
         proj.space = space;
         proj.viewCount = 2;
         proj.views = pv;
+        // the HUD's panel: held in front of the head (NX2NAVI_VR_HUD_SIZE centimetres wide, a metre away), over the view
+        XrCompositionLayerQuad hud{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        hud.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+        hud.space = view_space;
+        hud.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        hud.subImage.swapchain = hud_swapchain;
+        hud.subImage.imageRect = {{0, 0}, {(int32_t)x.width, (int32_t)x.height}};
+        hud.pose.orientation.w = 1.0f;
+        hud.pose.position.z = -1.0f;
+        {
+            const float wide = 0.01f * (float)cfg_int("NX2NAVI_VR_HUD_SIZE");
+            hud.size = {wide, x.width ? wide * (float)x.height / (float)x.width : 0};
+        }
+        const bool show_hud = shown_drawn.tracked && shown_drawn.hud && hud_has && hud_swapchain;
         const XrCompositionLayerBaseHeader *layers[] = {shown_drawn.tracked ? (const XrCompositionLayerBaseHeader *)&proj
-                                                                            : (const XrCompositionLayerBaseHeader *)&quad};
+                                                                            : (const XrCompositionLayerBaseHeader *)&quad,
+                                                        (const XrCompositionLayerBaseHeader *)&hud};
         if (shown_drawn.tracked) tracked_frames++;
         XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
         ei.displayTime = fs.predictedDisplayTime;
         ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-        ei.layerCount = have_image && fs.shouldRender ? 1 : 0;
+        ei.layerCount = have_image && fs.shouldRender ? (show_hud ? 2 : 1) : 0;
         ei.layers = layers;
         r = x.xrEndFrame(session, &ei);
         if (XR_FAILED(r)) rt_log("vr: xrEndFrame failed (%d)", (int)r);
         const uint64_t now = plat_now_ns();
         if (now - last_log > 10000000000ull) {
             rt_log("vr: %llu headset frames (%llu with the head's view), %llu pictures copied in the last 10 s (%u drawn "
-                   "from the head); the game's camera %u, lens %u", (unsigned long long)frames,
-                   (unsigned long long)tracked_frames, (unsigned long long)copies, x.tracked_pictures.exchange(0),
+                   "from the head, %u HUD panels made); the game's camera %u, lens %u", (unsigned long long)frames,
+                   (unsigned long long)tracked_frames, (unsigned long long)copies, x.tracked_pictures.exchange(0), x.panels.exchange(0),
                    x.camera_given.exchange(0), x.lens_given.exchange(0));
             frames = copies = tracked_frames = 0, last_log = now;
         }
@@ -714,6 +909,33 @@ extern "C" void vk_xr_untracked(void) {
     x.drawn.tracked = false;
 }
 
+extern "C" VkImage vk_xr_scene_image(VkImage target, uint32_t w, uint32_t h, VkFormat format, int *init) {
+    Xr &x = xr();
+    *init = 0;
+    if (!x.ok || !x.head_view.load(std::memory_order_relaxed) || !hud_wanted() || !target || !w || !h) return VK_NULL_HANDLE;
+    // other pictures pass through the upscaler too (a 2560x1440 sRGB one): only the one of the presented picture's size
+    // is the scene the HUD is drawn over
+    if (w != x.pic_w.load(std::memory_order_relaxed) || h != x.pic_h.load(std::memory_order_relaxed)) return VK_NULL_HANDLE;
+    std::lock_guard<std::mutex> lk(x.hud_mu);
+    if (x.hud_tried && !x.hud_pipe) return VK_NULL_HANDLE;   // the panel could not be made: the HUD stays in the picture
+    if (!x.scene || x.hud_w != w || x.hud_h != h || x.hud_format != format) {
+        // (images of another size are left behind: the picture's size changes rarely, at a setting)
+        x.scene = x.scene8 = x.panel8 = VK_NULL_HANDLE, x.used = x.kept;
+        if (!make_image(w, h, format, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, x.scene, x.scene_view)) {
+            static int told_fail;
+            if (told_fail++ < 4) rt_log("vr: the HUD panel's scene image %ux%u format %d could not be made", w, h, (int)format);
+            x.scene = VK_NULL_HANDLE;
+            return VK_NULL_HANDLE;
+        }
+        rt_log("vr: the HUD panel keeps the scene: %ux%u format %d", w, h, (int)format);
+        x.hud_w = w, x.hud_h = h, x.hud_format = format;
+        *init = 1;
+    }
+    x.hud_target = target;
+    x.kept++;
+    return x.scene;
+}
+
 extern "C" int vk_xr_wants_capture(int hdr) {
     Xr &x = xr();
     if (!x.ok || !x.timeline) return 0;
@@ -740,7 +962,10 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
     *signal = VkSemaphoreSubmitInfo{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
     if (!extent.width || !extent.height) return;
     const bool have_picture = picture && rect[2] > 0 && rect[3] > 0;
-    if (have_picture) x.picture_ratio.store((float)rect[2] / (float)rect[3], std::memory_order_relaxed);
+    if (have_picture) {
+        x.picture_ratio.store((float)rect[2] / (float)rect[3], std::memory_order_relaxed);
+        x.pic_w.store((uint32_t)rect[2], std::memory_order_relaxed), x.pic_h.store((uint32_t)rect[3], std::memory_order_relaxed);
+    }
     // the swapchain at the game's picture's size (the head's view shows it over the eyes' whole view, every pixel
     // counts); the boot screen before it, which has none, is not shown
     if (!x.want_w.load() && have_picture) x.want_h.store((uint32_t)rect[3]), x.want_w.store((uint32_t)rect[2]);
@@ -768,6 +993,13 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
         std::lock_guard<std::mutex> lk(x.frame_mu);
         d = x.drawn;
     }
+    // the HUD apart (NX2NAVI_VR_HUD=panel): the head's view without it, the HUD on its panel
+    uint32_t hw = 0, hh = 0;
+    if (d.tracked && hud_wanted()) {
+        std::lock_guard<std::mutex> lk(x.hud_mu);
+        d.hud = make_panel(cb);
+        hw = x.hud_w, hh = x.hud_h;
+    }
     x.box_drawn[slot] = d;
     if (d.tracked) x.tracked_pictures++;
     const VkImage box = x.boxes[slot];
@@ -775,7 +1007,14 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
     VkImageBlit b{};
     b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     b.dstOffsets[1] = {(int32_t)x.width, (int32_t)x.height, 1};
-    if (d.tracked) {
+    if (d.hud) {
+        b.srcOffsets[1] = {(int32_t)hw, (int32_t)hh, 1};
+        vkCmdBlitImage(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, box, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+        const VkImage hb = x.hud_boxes[slot];
+        barrier(cb, hb, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vkCmdBlitImage(cb, x.panel8, VK_IMAGE_LAYOUT_GENERAL, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+        barrier(cb, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    } else if (d.tracked) {
         b.srcOffsets[0] = {rect[0], rect[1], 0};
         b.srcOffsets[1] = {rect[0] + rect[2], rect[1] + rect[3], 1};
         vkCmdBlitImage(cb, picture, picture_layout, box, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);

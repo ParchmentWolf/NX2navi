@@ -38,6 +38,11 @@ int vk_xr_lens(float *angle);
 // vr_game.c: the game's own view this frame (an event's camera); its pictures go on the screen
 void vk_xr_untracked(void);
 
+// vk_exec_draw.c untranslated_dispatch_fallback, the game's scene upscaled into target (w x h, format), the HUD still to
+// be drawn over it: the image VR keeps it in (the caller copies it there in its stream), VK_NULL_HANDLE when the HUD's
+// panel is not made now. *init 1: the image is new (UNDEFINED; the caller makes it GENERAL first)
+VkImage vk_xr_scene_image(VkImage target, uint32_t w, uint32_t h, VkFormat format, int *init);
+
 // gfx_present.c present_image: 1 when VR takes this present's window image (then in TRANSFER_SRC_OPTIMAL for
 // vk_xr_capture); 0 records nothing
 int vk_xr_wants_capture(int hdr);

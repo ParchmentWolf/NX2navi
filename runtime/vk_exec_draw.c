@@ -37,6 +37,7 @@
 #include "platform/platform.h"
 #include "stutter_map.h"
 #include "vk_dlaa.h"
+#include "vk_xr.h"
 #include "mesh_emu_spirv.h"
 
 #define MAX_BINDINGS 128
@@ -7303,6 +7304,25 @@ static void untranslated_dispatch_fallback(VkExec *ex) {
     ex->recorded++;
     vk_exec_barrier(ex);
     vk_dlaa_upscaler(ex, di, df, dw, dh);   // the scene upscaler's output: DLSS's or FSR's picture goes there (vk_dlaa.c)
+    // VR's HUD panel (vk_xr.cpp): the upscaled scene kept before the HUD is drawn over it, in order in this stream
+    int xr_init = 0;
+    const VkImage xr_keep = vk_xr_scene_image(di, dw, dh, df, &xr_init);
+    if (xr_keep) {
+        vk_exec_barrier(ex);
+        if (xr_init) {
+            VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                        .image = xr_keep, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+            VkDependencyInfo dep = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &ib};
+            vkCmdPipelineBarrier2(ex->cb, &dep);
+        }
+        VkImageCopy cp = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                          .extent = {dw, dh, 1}};
+        vkCmdCopyImage(ex->cb, di, VK_IMAGE_LAYOUT_GENERAL, xr_keep, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        vk_exec_barrier(ex);
+    }
 }
 
 static void op_dispatch(VkExec *ex, const p_dispatch *d) {
