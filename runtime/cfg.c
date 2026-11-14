@@ -86,7 +86,7 @@ static const char *const known[] = {
     "MEM_BUDGET_TEST_VRAM_MB", "MEM_BUDGET_TEST_RAM_MB",
     "TEX_COMPACT", "TEX_COMPACT_MIN_MB", "TEX_COMPACT_FRAME_MB",   // texture compaction (vk_texture.c); no menu row
     "STANDIN_FILTER",   // the filter of the scene upscaler's stand-in (vk_tonemap.c); no menu row
-    "VR", "VR_SCREEN", "VR_VIEW", "VR_CAMERA", "VR_EYE_UP", "VR_EYE_SIDE", "VR_EYE_FORWARD",
+    "VR", "VR_SCREEN", "VR_VIEW", "VR_CAMERA", "VR_EYE_UP", "VR_EYE_SIDE", "VR_EYE_FORWARD", "VR_TURN",
     "PATCH_VR_LENS",   // VR through OpenXR (vk_xr.cpp, vr_game.c)
     // retired: the settings of the co-op of versions up to 0.9.2; read by nothing, listed so that a file which still
     // sets them logs no unknown key
@@ -202,7 +202,7 @@ static const CfgMeta metas[] = {
     {"VR", "0", "0|1", RESTART}, {"VR_SCREEN", "3.2,2.5", NULL, RESTART}, {"VR_VIEW", "head", "screen|head", LIVE},
     // vr_game.c: the head's view from Link's eyes (first) or the game's camera (third), and the eyes' offsets in cm
     {"VR_CAMERA", "first", "first|third", LIVE}, {"VR_EYE_UP", "0", "-30..30", LIVE}, {"VR_EYE_SIDE", "0", "-30..30", LIVE},
-    {"VR_EYE_FORWARD", "0", "-30..30", LIVE},
+    {"VR_EYE_FORWARD", "0", "-30..30", LIVE}, {"VR_TURN", "look", "look|off", LIVE},   // vr_game.c turn_link: in first person, Link faces where the head looks
     {"MONITOR", "auto", NULL, RESTART},   // auto|primary|<1-based index>|<part of a monitor name> (gfx_window_win.c, gfx_window_sdl.c chosen_monitor)
     {"PERF_OVERLAY", "off", "off|fps|full", LIVE},
     {"OUTPUT_RES", "1920x1080", NULL, RESTART}, {"RENDER_SCALE", "game", "game|50|67|75|100|125|150|200", RESTART},

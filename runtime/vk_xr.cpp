@@ -107,6 +107,10 @@ struct Xr {
     bool frame_on = false;
     Drawn drawn;
     std::atomic<uint32_t> camera_given{0}, lens_given{0}, tracked_pictures{0};
+    // the gameplay camera's updates since the last picture, and the pictures in a row with none: a paused game (the
+    // inventory) draws flat pictures while the camera stands still, and those go on the screen
+    std::atomic<uint32_t> updates{0};
+    int stale = 0;   // the present's thread alone
 };
 
 Xr &xr() {
@@ -690,6 +694,7 @@ extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3]) {
     x.frame_on = true;
     x.drawn.tracked = true, x.drawn.pose = head, x.drawn.lens = frustum(eyes, x.picture_ratio.load());
     x.camera_given++;
+    x.updates++;
     return 1;
 }
 
@@ -758,7 +763,8 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
     // the head's view: the game's picture (without the window's menu, which the screen shows) with the pose the last
     // gameplay camera update put on it; else the window for the screen
     Drawn d;
-    if (x.head_view.load(std::memory_order_relaxed) && have_picture) {
+    x.stale = x.updates.exchange(0) ? 0 : x.stale + 1;
+    if (x.head_view.load(std::memory_order_relaxed) && have_picture && x.stale < 3) {
         std::lock_guard<std::mutex> lk(x.frame_mu);
         d = x.drawn;
     }

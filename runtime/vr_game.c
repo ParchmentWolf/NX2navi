@@ -5,7 +5,8 @@
 // dbg_freecam_host, set freecam) sees the first in registers: for the gameplay camera the head's pose is put on them
 // there (vr_camera_update). The set vrlens's site is the angle's load (vr_lens_host): the headset's lens replaces it
 // for the same camera. Rendering and the game's culling both follow, as they read what the update made.
-// An event's camera keeps the game's own view, which vk_xr.cpp shows on its screen.
+// An event's camera keeps the game's own view, which vk_xr.cpp shows on its screen. In first person, Link faces where
+// the head looks while he stands (turn_link).
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
@@ -100,6 +101,39 @@ static int first_person_eye(double eye[3]) {
     return 1;
 }
 
+// First person's turn of Link toward the view (NX2NAVI_VR_TURN=look), while he stands upright (not climbing, swimming
+// or hanging), so what he holds and what reacts to his facing follow the head. His facing as the game keeps it, from
+// which his rotation, his physics and the rest are made each frame: the object component 0 points at (+0x60), its 3x4
+// matrix by rows at +0x1f8 (the position in each row's fourth float). Its rotation is made the turn about the vertical
+// toward the view. Walking, the game turns him toward his movement, which the head's view already steers.
+static void turn_link(const double ahead[3]) {
+    static float last[3];
+    static int have_last;
+    float feet[3];
+    const uint64_t actor = dbg_player_actor();
+    if (!actor || !dbg_player_pos(feet)) {
+        have_last = 0;
+        return;
+    }
+    const float dx = feet[0] - last[0], dz = feet[2] - last[2];
+    const int standing = have_last && dx * dx + dz * dz < 0.004f * 0.004f;
+    memcpy(last, feet, sizeof last), have_last = 1;
+    if (!standing || strcmp(cfg_value("NX2NAVI_VR_TURN"), "look") || strcmp(cfg_value("NX2NAVI_VR_CAMERA"), "first")) return;
+    const double n = sqrt(ahead[0] * ahead[0] + ahead[2] * ahead[2]);
+    if (!(n > 1e-4)) return;
+    const float s = (float)(ahead[0] / n), c = (float)(ahead[2] / n);
+    uint64_t components = 0, c0 = 0, facing = 0;
+    memcpy(&components, (const void *)(uintptr_t)(actor + 0x270), 8);
+    if (game_rw(components, 8)) memcpy(&c0, (const void *)(uintptr_t)components, 8);
+    if (game_rw(c0, 0x68)) memcpy(&facing, (const void *)(uintptr_t)(c0 + 0x60), 8);
+    float t[12];
+    if (!game_rw(facing, 0x1f8 + sizeof t)) return;
+    memcpy(t, (const void *)(uintptr_t)(facing + 0x1f8), sizeof t);
+    if (fabsf(t[5] - 1.0f) > 0.01f) return;   // not upright now
+    const float r[12] = {c, 0, s, t[3], 0, 1, 0, t[7], -s, 0, c, t[11]};
+    dbg_poke(facing + 0x1f8, r, sizeof r);
+}
+
 void vr_camera_update(Cpu *c, int scene) {
     static const int up_reg[3] = {7, 16, 6};
     if (scene != 1) return;
@@ -111,12 +145,27 @@ void vr_camera_update(Cpu *c, int scene) {
     double pos[3], at[3];
     float up[3];
     for (int i = 0; i < 3; i++) pos[i] = reg_d(c, i), at[i] = reg_d(c, 3 + i), up[i] = reg_s(c, up_reg[i]);
+    // the view put on last time handed back as it was (the game did not choose its camera again): the game's own from
+    // before it is used, so the head is never put on twice
+    static double in_pos[3], in_at[3], out_pos[3], out_at[3];
+    static float in_up[3];
+    static int have_out;
+    static unsigned fed_back;
+    if (have_out && !memcmp(pos, out_pos, sizeof pos) && !memcmp(at, out_at, sizeof at)) {
+        memcpy(pos, in_pos, sizeof pos), memcpy(at, in_at, sizeof at), memcpy(up, in_up, sizeof up);
+        if (!fed_back++) rt_log("vr: the game's camera handed back the head's view: its own view from before used");
+    }
+    memcpy(in_pos, pos, sizeof pos), memcpy(in_at, at, sizeof at), memcpy(in_up, up, sizeof up);
+    have_out = 0;
     double eye[3];
     if (vk_xr_head_active() && first_person_eye(eye))   // the game's camera's direction kept, from his eyes
         for (int i = 0; i < 3; i++) at[i] += eye[i] - pos[i], pos[i] = eye[i];
     if (!vk_xr_camera(pos, at, up)) return;
     for (int i = 0; i < 3; i++) set_d(c, i, pos[i]), set_d(c, 3 + i, at[i]), set_s(c, up_reg[i], up[i]);
+    memcpy(out_pos, pos, sizeof pos), memcpy(out_at, at, sizeof at), have_out = 1;
     head_camera = c->x[19];
+    const double ahead[3] = {at[0] - pos[0], at[1] - pos[1], at[2] - pos[2]};
+    turn_link(ahead);
 }
 
 void vr_lens_host(Cpu *c) {
