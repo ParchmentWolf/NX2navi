@@ -520,6 +520,38 @@ bool make_panel(VkCommandBuffer cb, bool keep_hud) {
     return true;
 }
 
+// (vk_xr_capture, a picture from the head) the performance overlay (ui/menu.cpp menu_perf_rect), drawn on the window
+// over the picture, copied from the window to the top middle of the HUD's panel, its size there as on the window; the
+// HUD box made a clear panel first when the picture has none
+void overlay_onto_hud(VkCommandBuffer cb, int slot, VkImage window, VkExtent2D extent, Drawn &d) {
+    Xr &x = xr();
+    int r[4];
+    if (!menu_perf_rect(r)) return;
+    const int x0 = std::max(r[0], 0), y0 = std::max(r[1], 0);
+    const int x1 = std::min(r[0] + r[2], (int)extent.width), y1 = std::min(r[1] + r[3], (int)extent.height);
+    if (x1 <= x0 || y1 <= y0) return;
+    const VkImage hb = x.hud_boxes[slot];
+    const bool fresh = !d.hud && !d.menu;
+    barrier(cb, hb, fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    if (fresh) {
+        const VkClearColorValue clear{};
+        const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cb, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &all);
+        barrier(cb, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    }
+    const float sx = (float)x.width / (float)extent.width, sy = (float)x.height / (float)extent.height;
+    const int w = std::max(1, (int)((x1 - x0) * sx)), h = std::max(1, (int)((y1 - y0) * sy));
+    const int dx = ((int)x.width - w) / 2, dy = (int)(0.03f * (float)x.height);
+    VkImageBlit b{};
+    b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    b.srcOffsets[0] = {x0, y0, 0}, b.srcOffsets[1] = {x1, y1, 1};
+    b.dstOffsets[0] = {dx, dy, 0}, b.dstOffsets[1] = {std::min(dx + w, (int)x.width), std::min(dy + h, (int)x.height), 1};
+    vkCmdBlitImage(cb, window, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
+                   VK_FILTER_LINEAR);
+    barrier(cb, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    if (fresh) d.hud = true;
+}
+
 // The depth stereo shader (shaders/xr_depth.comp): the scene and its depth sampled, the eye's RGBA8 image out
 bool make_depth_pipeline() {
     Xr &x = xr();
@@ -1318,6 +1350,7 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
         b.srcOffsets[1] = {rect[0] + rect[2], rect[1] + rect[3], 1};
         vkCmdBlitImage(cb, picture, picture_layout, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
         barrier(cb, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        overlay_onto_hud(cb, slot, window, extent, d);
         x.pending = slot;
         signal->semaphore = x.timeline;
         signal->value = ++x.next_value;
@@ -1370,6 +1403,10 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
                        VK_FILTER_LINEAR);
     }
     barrier(cb, box, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    if (d.tracked) {
+        overlay_onto_hud(cb, slot, window, extent, d);
+        x.box_drawn[slot] = d;
+    }
     x.pending = slot;
     signal->semaphore = x.timeline;
     signal->value = ++x.next_value;

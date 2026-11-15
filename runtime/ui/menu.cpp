@@ -2132,6 +2132,7 @@ static void perf_picture(const MenuTarget *t, PerfPanel *p) {
 }
 
 // The full panel (ui/perf_panel.cpp draws it in the menu's look): the numbers of this frame.
+static float g_perf_rect[4];   // where the overlay was drawn this frame (menu_perf_rect); width 0: nowhere
 static void perf_full_draw(const MenuTarget *t, float scale) {
     static PerfPanel p;
     perfmon_snapshot(&p.s);
@@ -2148,10 +2149,11 @@ static void perf_full_draw(const MenuTarget *t, float scale) {
     perf_picture(t, &p);
     p.fg_fps = gfx_output_fps() > 0 ? (float)gfx_output_fps() : 0;
     p.under_menu = g_open.load(std::memory_order_relaxed) != 0;
-    perf_panel_draw(&p, (float)t->width, scale);
+    perf_panel_draw(&p, (float)t->width, scale, g_perf_rect);
 }
 
 static void perf_draw(const MenuTarget *t, float scale) {
+    g_perf_rect[2] = 0;
     if (g_perf_mode == 2) return perf_full_draw(t, scale);
     float w = (float)t->width;
     if (!g_perf_mode || !g_perf_text[0]) return;
@@ -2163,6 +2165,13 @@ static void perf_draw(const MenuTarget *t, float scale) {
     // a small panel in the menu's look (ui/menu_skin.cpp), its frame scaled to the line
     skin_panel(dl, p, ImVec2(p.x + sz.x + padx * 2, p.y + sz.y + pady * 2), scale * 0.6f, 0.9f);
     dl->AddText(ImVec2(p.x + padx, p.y + pady), SKIN_TEXT, g_perf_text);
+    g_perf_rect[0] = p.x, g_perf_rect[1] = p.y, g_perf_rect[2] = sz.x + padx * 2, g_perf_rect[3] = sz.y + pady * 2;
+}
+
+int menu_perf_rect(int r[4]) {
+    if (!(g_perf_rect[2] > 0) || !(g_perf_rect[3] > 0)) return 0;
+    for (int i = 0; i < 4; i++) r[i] = (int)(i < 2 ? floorf(g_perf_rect[i]) : ceilf(g_perf_rect[i]));
+    return 1;
 }
 
 // The note after F8 (bugcap.c): the capture's number and its folder's name for a few seconds, top centre, in the
