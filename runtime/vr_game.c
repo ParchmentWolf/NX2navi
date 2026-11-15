@@ -141,6 +141,131 @@ static int link_aims(void) {
 // gameplay camera updated a moment ago (not the title, a load, an event), Link there and not in one of his scripted
 // Demo states (the ocarina among them), and the game not paused by its menus (its three pause steps' flags). An item
 // wheel's slot is equipped (its era's AssignableItem enum) a few reads after the release, once the quick select closed.
+
+// VR's hands (Play style Motion): Link's own gear hidden from the picture, so only the hands' copies show. The gear's
+// actors (named Weapon_..., and the item held, Item_...) sit in the actor heap near Link's; a sweep of 64 MB either side
+// of his actor, kept inside the block of memory his actor is in (outside it reads fault the game's mirroring), 4 MB a
+// read of the pad, finds them by an actor's shape (a vtable of the game's, its name's string at
+// +0x20, an upright rotation at +0x328 and its place at +0x31c near Link's), and is begun again every few seconds, as
+// gear comes and goes, and at once when an item is taken out. Each is checked again before it is touched, and once
+// found for a moment (three seconds in an area just entered, while the game still makes it) hidden as first person hides Link (hide_link):
+// the alphas of its components of the fade's two kinds below zero, every frame; the game eases them back when this
+// stops. Only reads of the game's thread, in the heap and alias ranges alone (a pointer elsewhere is not followed).
+static int in_ranges(uint64_t v, uint64_t n) {
+    const RtGuestLayout *l = mem_layout();
+    const RtRange r[2] = {l->heap, l->alias};
+    for (int i = 0; i < 2; i++)
+        if (v >= r[i].base && v - r[i].base < r[i].size && n <= r[i].size - (v - r[i].base)) return 1;
+    return 0;
+}
+static int readable(uint64_t v, uint64_t n) {   // the 64 KB blocks' answers kept a while
+    enum { SLOTS = 4096 };
+    static uint64_t block[SLOTS];
+    static int8_t ok[SLOTS];
+    if (!in_ranges(v, n)) return 0;
+    for (uint64_t b = v >> 16; b <= (v + n - 1) >> 16; b++) {
+        const unsigned h = (unsigned)(b * 2654435761u) % SLOTS;
+        if (block[h] != b + 1) block[h] = b + 1, ok[h] = (int8_t)mem_readable(b << 16, 1 << 16);
+        if (!ok[h]) return 0;
+    }
+    return 1;
+}
+// a gear actor of Link's at v: its name (Weapon_..., or the held item's) and an actor's rotation and place near him
+static int gear_actor(uint64_t v, const char *item, const float link[3]) {
+    uint64_t np = 0;
+    if (!readable(v, 0x360)) return 0;
+    memcpy(&np, (const void *)(uintptr_t)(v + 0x20), 8);
+    if (!readable(np, 40)) return 0;
+    char name[40];
+    memcpy(name, (const void *)(uintptr_t)np, 39), name[39] = 0;
+    // the held item's actor: its model's name begins with the actor's (Item_Bottle for Item_Bottle_Fish) or the other way
+    const size_t stem = strcspn(item, "."), nl = strlen(name);
+    const int held = item[0] && nl >= 6 && (!strncmp(name, item, stem) || (nl <= stem && !strncmp(item, name, nl)));
+    if (memcmp(name, "Weapon_", 7) && !held) return 0;
+    float pos[3], m[9];
+    memcpy(pos, (const void *)(uintptr_t)(v + 0x31c), 12), memcpy(m, (const void *)(uintptr_t)(v + 0x328), 36);
+    for (int r = 0; r < 3; r++) {
+        const float n = m[3 * r] * m[3 * r] + m[3 * r + 1] * m[3 * r + 1] + m[3 * r + 2] * m[3 * r + 2];
+        if (!isfinite(n) || fabsf(n - 1.0f) > 0.05f) return 0;
+    }
+    for (int i = 0; i < 3; i++)
+        if (!isfinite(pos[i]) || fabsf(pos[i] - link[i]) > 3.0f) return 0;
+    return 1;
+}
+static void hide_actor(uint64_t actor) {
+    static const float hidden = -1.0f;
+    uint64_t comps = 0;
+    memcpy(&comps, (const void *)(uintptr_t)(actor + 0x270), 8);
+    for (int i = 0; i < 128 && readable(comps + i * 8, 8); i++) {   // (the fades are at 14, 76 and 79)
+        uint64_t c = 0, vt = 0;
+        memcpy(&c, (const void *)(uintptr_t)(comps + i * 8), 8);
+        if (!readable(c, 0x140)) continue;
+        memcpy(&vt, (const void *)(uintptr_t)c, 8);
+        if (vt == MOD_MAIN_BASE + 0x4b4a5a0) dbg_poke(c + 0x118, &hidden, sizeof hidden);
+        else if (vt == MOD_MAIN_BASE + 0x4b4b4a8) dbg_poke(c + 0x130, &hidden, sizeof hidden);
+    }
+}
+static void hide_gear(const char *item) {
+    enum { MAX = 16, WINDOW = 64 << 20, STEP = 4 << 20 };
+    static uint64_t link_actor, arrived;   // Link's actor, and when it was new (an area entered)
+    static char last_item[96];
+    static uint64_t gear[MAX], since[MAX], sweep_at, sweep_end, next_sweep;   // since: when first found (plat_now_ns)
+    static int told[MAX];
+    static int n;
+    float link[3];
+    const uint64_t player = dbg_player_actor();
+    if (!player || !dbg_player_pos(link) || strcmp(cfg_value("NX2NAVI_VR_PLAY"), "motion") ||
+        strcmp(cfg_value("NX2NAVI_VR_CONTROLS"), "meta") || !vk_xr_head_active()) {
+        n = 0, sweep_at = sweep_end = 0;
+        return;
+    }
+    int kept = 0;   // the ones found still gear (an actor's slot may be another's now)
+    for (int i = 0; i < n; i++)
+        if (gear_actor(gear[i], item, link)) gear[kept] = gear[i], since[kept] = since[i], told[kept++] = told[i];
+    n = kept;
+    const uint64_t now = plat_now_ns();
+    if (player != link_actor) link_actor = player, arrived = now;
+    if (strcmp(item, last_item)) {   // an item taken out: its actor looked for at once
+        snprintf(last_item, sizeof last_item, "%s", item);
+        if (item[0]) next_sweep = 0, sweep_end = sweep_at;
+    }
+    if (sweep_at >= sweep_end && now >= next_sweep) {   // a sweep begun, within the block of memory Link's actor is in
+        RtMemoryInfo mi;
+        next_sweep = now + 3000000000ull;
+        if (!mem_query(player, &mi) && mi.state && (mi.perm & 3) == 3) {
+            const uint64_t lo = player - mi.base > WINDOW ? player - WINDOW : mi.base;
+            const uint64_t hi = mi.base + mi.size - player > WINDOW ? player + WINDOW : mi.base + mi.size;
+            sweep_at = (lo + 7) & ~7ull, sweep_end = hi - 8;
+        }
+    }
+    if (sweep_at < sweep_end) {   // its next 2 MB
+        const uint64_t to = sweep_at + STEP < sweep_end ? sweep_at + STEP : sweep_end;
+        for (uint64_t q = sweep_at; q < to; q += 8) {
+            uint64_t vt;
+            memcpy(&vt, (const void *)(uintptr_t)q, 8);
+            if (vt < MOD_MAIN_BASE || vt >= MOD_MAIN_BASE + 0x8000000ull || !gear_actor(q, item, link)) continue;
+            int dup = 0;
+            for (int i = 0; i < n; i++) dup |= gear[i] == q;
+            if (!dup && n < MAX) gear[n] = q, since[n] = now, told[n++] = 0;
+        }
+        sweep_at = to;
+    }
+    // hidden once found for a moment, or three seconds in an area just entered (never while the game still makes it)
+    const uint64_t settle = now - arrived < 5000000000ull ? 3000000000ull : 300000000ull;
+    for (int i = 0; i < n; i++)
+        if (now - since[i] > settle) {
+            if (!told[i]) {
+                uint64_t np = 0;
+                char name[40] = "";
+                memcpy(&np, (const void *)(uintptr_t)(gear[i] + 0x20), 8);
+                if (readable(np, 40)) memcpy(name, (const void *)(uintptr_t)np, 39), name[39] = 0;
+                rt_log("vr: hands: Link's %s hidden (%#llx)", name, (unsigned long long)gear[i]);
+                told[i] = 1;
+            }
+            hide_actor(gear[i]);
+        }
+}
+
 static int hand_item(char out[96]);
 void vr_tick(Cpu *c) {
     char state[48];
@@ -153,6 +278,7 @@ void vr_tick(Cpu *c) {
         vk_xr_gear(sword, shield);
         vk_xr_weapon_out(hand_item(item));
         vk_xr_hand_item(item);
+        hide_gear(item);
     }
     int slot;
     const int open = vk_xr_wheel(&slot) != 0;

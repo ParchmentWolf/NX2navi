@@ -1013,6 +1013,9 @@ Mat4 held(int item, int right_hand, const VrModel &m, const char *name) {
             const float gx = r.m[4 * k], gy = r.m[4 * k + 1];
             r.m[4 * k] = c * gx - n * gy, r.m[4 * k + 1] = n * gx + c * gy;
         }
+        // the game's shields are made for Link's right arm: on the left hand mirrored along their straps (model x)
+        if (!right_hand)
+            for (int i = 0; i < 3; i++) r.m[i] = -r.m[i];
     }
     return r;
 }
