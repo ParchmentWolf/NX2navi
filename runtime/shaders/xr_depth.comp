@@ -4,8 +4,8 @@
 // that in the picture's [0, 1]: the scene texel at u lands at u - move(u). Each output pixel scans its row's texels that
 // can land on it (a move is at most `most`, to one side) and takes, of the neighbouring pairs that land around it on one
 // surface, the nearest, as a depth test does. Where only pairs across a depth step land around it (the gap beside a near
-// thing that this eye sees and the middle did not), the farther of the two fills it: the background, stretched, never a
-// copy of the near thing.
+// thing that this eye sees and the middle did not), the background beside the step fills it, a few of its texels
+// averaged away from the edge so the fill is soft rather than one edge texel drawn out, never a copy of the near thing.
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D color;   // the scene, sRGB-encoded bytes (RGBA8 UNORM)
 layout(binding = 1) uniform sampler2D depth;   // the scene's depth (R32F, as stored), at the scene's own size
@@ -33,6 +33,7 @@ void main() {
     const int k0 = clamp(int(floor(lo * w)) - 1, 0, dsize.x - 1), k1 = clamp(int(ceil(hi * w)) + 1, 0, dsize.x - 1);
     float best = -1.0, best_u = uv.x;   // the nearest surface found landing here, and where it is in the scene
     float hole = 1e9, hole_u = uv.x;    // else the farther side of the nearest depth step landing around here
+    float hole_dir = 0.0;               // and which way the background goes on from it
     float ia = inv_distance(ivec2(k0, row));
     float ua = (float(k0) + 0.5) / w;
     float la = ua - clamp(0.5 * p.shift * ia, -p.most, p.most);
@@ -47,11 +48,16 @@ void main() {
                 if (i > best) best = i, best_u = mix(ua, ub, t);
             } else {   // a depth step: what is behind it shows here unless a surface does
                 const float far_i = min(ia, ib);
-                if (far_i < hole) hole = far_i, hole_u = ia < ib ? ua : ub;
+                if (far_i < hole) hole = far_i, hole_u = ia < ib ? ua : ub, hole_dir = ia < ib ? -1.0 : 1.0;
             }
         }
         ia = ib, ua = ub, la = lb;
     }
-    const float u = best >= 0.0 ? best_u : hole < 1e9 ? hole_u : uv.x;
-    imageStore(eye, at, texture(color, vec2(u, uv.y)));
+    if (best < 0.0 && hole < 1e9) {
+        vec4 sum = vec4(0.0);
+        for (int j = 0; j < 6; j++) sum += texture(color, vec2(hole_u + hole_dir * float(j) * 1.5 / w, uv.y));
+        imageStore(eye, at, sum / 6.0);
+        return;
+    }
+    imageStore(eye, at, texture(color, vec2(best >= 0.0 ? best_u : uv.x, uv.y)));
 }

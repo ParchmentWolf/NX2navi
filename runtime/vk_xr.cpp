@@ -586,7 +586,8 @@ bool make_eyes(VkCommandBuffer cb, const Drawn &d) {
         }
         x.push_set(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.depth_layout, 0, 3, w);
         const float side = (e ? 0.5f : -0.5f) * d.ipd * strength;   // the left eye to the left: the scene moves right in it
-        const float pc[7] = {(float)x.hud_w, (float)x.hud_h, side / tan_x, planes[0], planes[1], 0.08f, 1.0f / 0.05f};
+        // nothing nearer than 30 cm moves more than it would there: the gaps beside the nearest things stay narrow
+        const float pc[7] = {(float)x.hud_w, (float)x.hud_h, side / tan_x, planes[0], planes[1], 0.08f, 1.0f / 0.3f};
         vkCmdPushConstants(cb, x.depth_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
         vkCmdDispatch(cb, (x.hud_w + 7) / 8, (x.hud_h + 7) / 8, 1);
         barrier(cb, x.eye8[e], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
