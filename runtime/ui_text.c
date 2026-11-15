@@ -81,8 +81,9 @@ static const char *const text_en[UI_TEXT_COUNT] = {
         "Hold that hand's stick toward a slot and release the trigger to use it; flick the stick toward a slot and let go "
         "to swap what it holds (bombs or bombchus, the arrows, the seed or beans). Menu pressed: + (primary menu). "
         "Menu held: - (secondary menu). "
-        "Swinging the sword hand: Y (sword). Playing the ocarina: the right stick's left, up, right and down play Y, X, "
-        "A and R, the A button L.",
+        "Swinging the sword hand: Y (sword). Both hands together behind your head: draw the sword and shield, or put "
+        "them away. "
+        "Playing the ocarina: the right stick's left, up, right and down play Y, X, A and R, the A button L.",
     [UI_MENU_VR_HANDEDNESS] = "Handedness", [UI_MENU_VR_HANDEDNESS_RIGHT] = "Right-handed",
     [UI_MENU_VR_HANDEDNESS_LEFT] = "Left-handed",
     [UI_MENU_VR_HANDEDNESS_DESC] = "Which hand holds the sword (Meta/Oculus): its swing slashes and charges. The other "

@@ -114,7 +114,7 @@ static _Atomic uint64_t play_at;   // when the gameplay camera last updated outs
 static _Atomic int hooks_on;       // vr_game_start switched the camera hooks on: play_at is kept
 
 // Link's state's name (his component 107, the name at its +0x244: "Wait", "CrouchGuard"...), or his upper body's
-// (upper: at +0x34c, "BowChargeUpper"...), "" when there is none
+// (at +0x34c, "BowChargeUpper"...; with a weapon out, +0x31c "CommonUpper"), "" when there is none
 static void link_state_at(char out[48], uint32_t at) {
     out[0] = 0;
     const uint64_t actor = dbg_player_actor();
@@ -145,6 +145,9 @@ void vr_tick(Cpu *c) {
     char state[48];
     link_state(state);
     vk_xr_ocarina(!strncmp(state, "DemoOcarina", 11));   // playing the ocarina (a lesson's too)
+    char weapon[48];   // his upper body with a weapon out: "CommonUpper" ("" once put away)
+    link_state_at(weapon, 0x31c);
+    vk_xr_weapon_out(weapon[0] && strcmp(weapon, "WeaponEquipOffUpper"));
     int slot;
     const int open = vk_xr_wheel(&slot) != 0;
     int p = 0, pre = 0, post = 0;

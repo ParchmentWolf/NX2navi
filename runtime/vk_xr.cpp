@@ -201,6 +201,7 @@ struct Xr {
     std::atomic<bool> wheel_allowed{true};   // vr_game.c: the game is not paused by its own menus
     std::atomic<uint64_t> wheel_closed_at{0};   // plat_now_ns at a wheel's close
     std::atomic<bool> ocarina{false};   // vr_game.c: Link plays the ocarina (the controllers' Ocarina mode)
+    std::atomic<bool> weapon_out{false};   // vr_game.c: Link holds his sword and shield (or another weapon) out
     // the last picture drawn from the head whose world scene8 and eye8 still hold (the present's thread alone): a paused
     // game's menus go on the HUD's panel in front of that world, frozen as it was
     Drawn frozen;
@@ -822,7 +823,8 @@ bool make_eyes(VkCommandBuffer cb, const Drawn &d) {
 // outward and left the hand out to the side (the charge), until the hand comes back in. The left trigger held opens the D-pad wheel, the right one the
 // item wheel (vr_wheel.c; ui/menu.cpp draws them): that hand's stick held toward a slot picks it and the trigger's
 // release uses it (the D-pad's direction pressed, or the item equipped by vr_game.c), a flick toward a slot swaps what
-// it holds. While Link plays the ocarina (vk_xr_ocarina) the notes swap places: the right stick's left, up, right and
+// it holds. Both hands brought together behind the head draw the sword and shield (a tap of Y) or, while they are out,
+// put them away (B). While Link plays the ocarina (vk_xr_ocarina) the notes swap places: the right stick's left, up, right and
 // down play Y, X, A and R, the A button L; no sword, jump or wheel meanwhile. NX2NAVI_VR_CONTROLS=meta puts them on the
 // pad (vk_xr_pad); gamepad leaves the pad to the gamepad.
 struct Controls {
@@ -865,6 +867,13 @@ struct Controls {
     int swing_n = 0, swing_hand = 1;
     bool swinging = false, outward = false, charging = false, queued = false;
     uint64_t y_down = 0, y_up = 0;   // the tap's press and release (0: none now)
+    // the draw: both grips behind the head's eyes (behind_on), no lower than shoulder_drop under them and within
+    // together_on of each other; once a draw, again only after the hands parted (apart_off) and refractory
+    static constexpr float behind_on = 0.03f, shoulder_drop = 0.30f, together_on = 0.25f, apart_off = 0.35f;
+    static constexpr uint64_t draw_refractory_ns = 800000000ull;
+    bool draw_armed = true;
+    uint64_t draw_at = 0, draw_until = 0;
+    int draw_bit = -1;
 
     XrPath path(const char *s) {
         XrPath p = XR_NULL_PATH;
@@ -956,7 +965,8 @@ struct Controls {
         return XR_SUCCEEDED(xr().xrGetActionStateFloat(session, &gi, &st)) && st.isActive ? st.currentState : 0.0f;
     }
     // this headset frame's buttons, sticks and grips (time: the frame's predicted display time) into the Xr's
-    void read(XrSession session, XrSpace space, XrTime time, const float head[3]) {
+    void read(XrSession session, XrSpace space, XrTime time, const Pose &head_pose) {
+        const float *head = head_pose.p;
         if (!ok) return;
         Xr &x = xr();
         XrActiveActionSet active{set, XR_NULL_PATH};
@@ -1036,6 +1046,34 @@ struct Controls {
                 pose_ok[h] = true;
             }
         }
+        // the head's level forward (fx, fz), OpenXR's x right and z back, and where each hand is
+        // behind the eyes along it (back_any), and so for the draw when no lower than the shoulders (behind)
+        float fx = 0, fz = -1;
+        {
+            static const float ahead[3] = {0, 0, -1};
+            float f[3];
+            rotate(head_pose.q, ahead, f);
+            const float n = std::sqrt(f[0] * f[0] + f[2] * f[2]);
+            if (n > 1e-3f) fx = f[0] / n, fz = f[2] / n;
+        }
+        float behind[2] = {-1.0f, -1.0f}, back_any[2] = {-1.0f, -1.0f};
+        for (int h = 0; h < 2; h++)
+            if (pose_ok[h]) {
+                const float dx = poses[h].p[0] - head[0], dz = poses[h].p[2] - head[2];
+                back_any[h] = -(dx * fx + dz * fz);
+                if (poses[h].p[1] > head[1] - shoulder_drop) behind[h] = back_any[h];
+            }
+        if (pose_ok[0] && pose_ok[1]) {
+            float d2 = 0;
+            for (int c = 0; c < 3; c++) d2 += (poses[0].p[c] - poses[1].p[c]) * (poses[0].p[c] - poses[1].p[c]);
+            const bool drawn = behind[0] > behind_on && behind[1] > behind_on && d2 < together_on * together_on;
+            if (drawn && draw_armed && now - draw_at >= draw_refractory_ns && !x.ocarina.load()) {
+                draw_bit = x.weapon_out.load() ? B : Y;
+                draw_at = now, draw_until = now + press_ns, draw_armed = false;
+                y_down = 0, charging = false, queued = false;   // a swing on the way there is not one
+            }
+            if (!draw_armed && (d2 > apart_off * apart_off || behind[0] < 0 || behind[1] < 0)) draw_armed = true;
+        }
         const float swing_on = 0.01f * (float)cfg_int("NX2NAVI_VR_SWING_SPEED");   // metres a second
         const float out_on = 0.01f * (float)cfg_int("NX2NAVI_VR_CHARGE_REACH"), out_off = out_on - 0.1f;   // metres
         bool swung = false;
@@ -1054,7 +1092,10 @@ struct Controls {
                 float v[3];
                 for (int c = 0; c < 3; c++) v[c] = dt > 0 ? (swing_p[i][c] - swing_p[o][c]) / dt : 0.0f;
                 const float speed = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-                if (!swinging && speed > swing_on && now - swing_at >= refractory_ns) {
+                // none starts with the hand out to the side of the head or behind it, or moving mostly back toward the
+                // body: pulling the hands back (to draw, to rest) is not a swing
+                const bool back = back_any[sword] > -0.03f || v[0] * fx + v[2] * fz < -0.5f * speed;
+                if (!swinging && speed > swing_on && now - swing_at >= refractory_ns && !back) {
                     swinging = swung = true;
                     swing_at = now;
                     // outward: most of the motion away from the head's upright line
@@ -1076,6 +1117,7 @@ struct Controls {
         }
         if (!y_down && queued && now - y_up >= gap_ns) y_down = now, queued = false, outward = outward && swinging;
         set_bit(Y, y_down != 0);
+        if (now < draw_until) set_bit(draw_bit, true);
         if (ocarina) {   // the notes: the right stick's left, up, right and down Y, X, A and R; the A button L
             const bool a_down = bits & (1ull << A);
             bits &= ~(1ull << A | 1ull << X | 1ull << Y | 1ull << L | 1ull << R);
@@ -1282,12 +1324,12 @@ void run(void *) {
             }
         }
         {
-            float head_p[3];
+            Pose head_now;
             {
                 std::lock_guard<std::mutex> lk(x.head_mu);
-                std::memcpy(head_p, x.head.p, sizeof head_p);
+                head_now = x.head;
             }
-            controls.read(session, space, fs.predictedDisplayTime, head_p);
+            controls.read(session, space, fs.predictedDisplayTime, head_now);
         }
 
         int slot = -1;
@@ -1678,6 +1720,8 @@ extern "C" int vk_xr_wheel_used(int *kind, int *slot) {
 extern "C" void vk_xr_wheel_allow(int allow) { xr().wheel_allowed.store(allow != 0); }
 
 extern "C" void vk_xr_ocarina(int on) { xr().ocarina.store(on != 0); }
+
+extern "C" void vk_xr_weapon_out(int out) { xr().weapon_out.store(out != 0); }
 
 extern "C" void vk_xr_aim(int on, const double origin[3], const double dir[3]) {
     Xr &x = xr();
