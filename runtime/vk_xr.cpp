@@ -190,6 +190,7 @@ struct Xr {
     int used_kind = 0, used_slot = -1;   // a wheel's slot used at its trigger's release, until vk_xr_wheel_used takes it
     std::atomic<bool> wheel_allowed{true};   // vr_game.c: the game is not paused by its own menus
     std::atomic<uint64_t> wheel_closed_at{0};   // plat_now_ns at a wheel's close
+    std::atomic<bool> ocarina{false};   // vr_game.c: Link plays the ocarina (the controllers' Ocarina mode)
     // the last picture drawn from the head whose world scene8 and eye8 still hold (the present's thread alone): a paused
     // game's menus go on the HUD's panel in front of that world, frozen as it was
     Drawn frozen;
@@ -755,7 +756,9 @@ bool make_eyes(VkCommandBuffer cb, const Drawn &d) {
 // outward and left the hand out to the side (the charge), until the hand comes back in. The left trigger held opens the D-pad wheel, the right one the
 // item wheel (vr_wheel.c; ui/menu.cpp draws them): that hand's stick held toward a slot picks it and the trigger's
 // release uses it (the D-pad's direction pressed, or the item equipped by vr_game.c), a flick toward a slot swaps what
-// it holds. NX2NAVI_VR_CONTROLS=meta puts them on the pad (vk_xr_pad); gamepad leaves the pad to the gamepad.
+// it holds. While Link plays the ocarina (vk_xr_ocarina) the notes swap places: the right stick's left, up, right and
+// down play Y, X, A and R, the A button L; no sword, jump or wheel meanwhile. NX2NAVI_VR_CONTROLS=meta puts them on the
+// pad (vk_xr_pad); gamepad leaves the pad to the gamepad.
 struct Controls {
     enum { A = 0, B, X, Y, STICK_L, STICK_R, L, R, ZL, ZR, PLUS, MINUS, LEFT, UP, RIGHT, DOWN };
     // the D-pad wheel's slots, 0 up and clockwise: the accessory, Navi, the boots, the ocarina
@@ -934,7 +937,9 @@ struct Controls {
             if (usable) used_kind = wheel, used_slot = wheel_slot;
             wheel = 0;
         }
-        if (!wheel && (trigger_on[0] || trigger_on[1]) && x.wheel_allowed.load()) wheel = trigger_on[0] ? 1 : 2, tap_slot = -1;
+        const bool ocarina = x.ocarina.load();   // playing the ocarina: no wheel (its held L would play a note)
+        if (!wheel && !ocarina && (trigger_on[0] || trigger_on[1]) && x.wheel_allowed.load())
+            wheel = trigger_on[0] ? 1 : 2, tap_slot = -1;
         const int was_slot = wheel_slot;
         wheel_slot = -1;
         if (wheel) {   // the wheel's own hand's stick picks
@@ -1005,6 +1010,15 @@ struct Controls {
         }
         if (!y_down && queued && now - y_up >= gap_ns) y_down = now, queued = false, outward = outward && swinging;
         set_bit(Y, y_down != 0);
+        if (ocarina) {   // the notes: the right stick's left, up, right and down Y, X, A and R; the A button L
+            const bool a_down = bits & (1ull << A);
+            bits &= ~(1ull << A | 1ull << X | 1ull << Y | 1ull << L | 1ull << R);
+            y_down = 0, charging = false, queued = false;   // no sword meanwhile
+            set_bit(L, a_down);
+            const float sx = sticks[1][0], sy = sticks[1][1];
+            if (sx * sx + sy * sy > 0.25f)
+                set_bit(std::fabs(sx) > std::fabs(sy) ? (sx < 0 ? Y : A) : (sy > 0 ? X : R), true);
+        }
         std::lock_guard<std::mutex> lk(x.hands_mu);
         x.hand_buttons = bits;
         x.wheel_open = wheel, x.wheel_slot = wheel_slot;
@@ -1558,6 +1572,7 @@ extern "C" int vk_xr_pad(uint64_t *buttons, int32_t left[2], int32_t right[2]) {
         std::memcpy(sticks, x.hand_sticks, sizeof sticks);
         wheel = x.wheel_open;
     }
+    if (x.ocarina.load()) sticks[1][0] = sticks[1][1] = 0, right[0] = right[1] = 0;   // the right stick plays the notes
     if (wheel) {   // the wheel's hand's stick picks on it, not in the game
         int32_t *s = wheel == 1 ? left : right;
         sticks[wheel - 1][0] = sticks[wheel - 1][1] = 0, s[0] = s[1] = 0;
@@ -1595,6 +1610,8 @@ extern "C" int vk_xr_wheel_used(int *kind, int *slot) {
 }
 
 extern "C" void vk_xr_wheel_allow(int allow) { xr().wheel_allowed.store(allow != 0); }
+
+extern "C" void vk_xr_ocarina(int on) { xr().ocarina.store(on != 0); }
 
 
 extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3]) {

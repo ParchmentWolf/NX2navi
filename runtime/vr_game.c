@@ -111,10 +111,28 @@ static int first_person_eye(double eye[3]) {
 // forward, the game turns him toward his movement, which the head's view steers; sideways or back he strafes (vr_pad).
 static _Atomic uint64_t fp_at;   // when Link was last turned to the head in first person
 
-// The game's thread at each pad read: VR's wheels. While one is open vk_xr.cpp holds the game's own quick select (L),
-// which pauses the game; a wheel does not open while the game's menus pause it (its three pause steps' flags). An item
-// wheel's slot is equipped (its era's AssignableItem enum) a few reads after the release, once the quick select closed.
+// Link's state's name (his component 107, the name at its +0x244: "Wait", "CrouchGuard"...), "" when there is none
+static void link_state(char out[48]) {
+    out[0] = 0;
+    const uint64_t actor = dbg_player_actor();
+    uint64_t components = 0, c107 = 0;
+    if (!actor || !game_rw(actor + 0x270, 8)) return;
+    memcpy(&components, (const void *)(uintptr_t)(actor + 0x270), 8);
+    if (!game_rw(components + 107 * 8, 8)) return;
+    memcpy(&c107, (const void *)(uintptr_t)(components + 107 * 8), 8);
+    if (!game_rw(c107 + 0x244, 47)) return;
+    memcpy(out, (const void *)(uintptr_t)(c107 + 0x244), 47);
+    out[47] = 0;
+}
+
+// The game's thread at each pad read: whether Link plays the ocarina (his state DemoOcarina), and VR's wheels. While
+// one is open vk_xr.cpp holds the game's own quick select (L), which pauses the game; a wheel does not open while the
+// game's menus pause it (its three pause steps' flags). An item wheel's slot is equipped (its era's AssignableItem
+// enum) a few reads after the release, once the quick select closed.
 void vr_tick(Cpu *c) {
+    char state[48];
+    link_state(state);
+    vk_xr_ocarina(!strcmp(state, "DemoOcarina"));   // playing the ocarina
     int slot;
     const int open = vk_xr_wheel(&slot) != 0;
     int p = 0, pre = 0, post = 0;

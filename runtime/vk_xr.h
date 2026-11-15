@@ -52,6 +52,8 @@ int vk_xr_wheel(int *slot);
 // a wheel may open now (not while the game's own menus pause it)
 int vk_xr_wheel_used(int *kind, int *slot);
 void vk_xr_wheel_allow(int allow);
+// vr_game.c, the game's thread: Link plays the ocarina now (the controllers' notes then on the right stick)
+void vk_xr_ocarina(int on);
 // The game's own view this frame (the head's view not applied); its pictures go on the screen
 void vk_xr_untracked(void);
 
