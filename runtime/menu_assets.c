@@ -10,7 +10,7 @@
 //   format (+0x1c), width and height (+0x24, +0x28), the block height of the block-linear layout as log2 of GOBs
 //   (+0x34), the level size (+0x50), the name (+0x60, a u16-length string) and the level offsets (+0x70). The levels
 //   are block linear in the Switch 2 GOB layout (tex_deswizzle.c tex_bl_copy). BC4 masks become white with the mask as
-//   alpha (the menu tints them), ASTC 4x4 goes through the runtime's decoder.
+//   alpha (the menu tints them), ASTC (any block size; VR's hands' models use 6x6) goes through the runtime's decoder.
 #include <stdlib.h>
 #include <string.h>
 
@@ -199,7 +199,11 @@ int menu_asset_texture(const uint8_t *bntx, size_t n, const char *name, uint8_t 
         if (data + size > n) return 0;
         uint32_t kind = fmt >> 8, bpb, bw = 4, bh = 4;
         if (kind == 0x1d) bpb = 8;                       // BC4
-        else if (kind == 0x2d) bpb = 16;                 // ASTC 4x4
+        else if (kind >= 0x2d && kind <= 0x3a) {        // ASTC, 4x4 to 12x12
+            static const uint8_t dims[14][2] = {{4, 4}, {5, 4}, {5, 5}, {6, 5}, {6, 6}, {8, 5}, {8, 6},
+                                                {8, 8}, {10, 5}, {10, 6}, {10, 8}, {10, 10}, {12, 10}, {12, 12}};
+            bpb = 16, bw = dims[kind - 0x2d][0], bh = dims[kind - 0x2d][1];
+        }
         else if (kind == 0x0b) bpb = 4, bw = bh = 1;     // R8G8B8A8
         else {
             rt_log("menu: interface texture %s has format %#x, not read", name, fmt);
@@ -214,7 +218,7 @@ int menu_asset_texture(const uint8_t *bntx, size_t n, const char *name, uint8_t 
         memcpy(bl, bntx + data, size);
         tex_bl_copy(bl, lin, row, row, hb, 1, th, 0, 1);
         if (kind == 0x1d) bc4_decode(lin, wb, hb, w, h, rgba);
-        else if (kind == 0x2d) astc_decode_ldr(lin, w, h, 4, 4, (fmt & 0xff) == 6, rgba);
+        else if (kind >= 0x2d && kind <= 0x3a) astc_decode_ldr(lin, w, h, bw, bh, (fmt & 0xff) == 6, rgba);
         else memcpy(rgba, lin, (size_t)w * h * 4);
         free(bl), free(lin);
         *rgba_out = rgba, *w_out = w, *h_out = h;

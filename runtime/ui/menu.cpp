@@ -1824,6 +1824,10 @@ static void tab_vr(float scale) {
         static const UiTextId hands[] = {UI_MENU_VR_HANDEDNESS_LEFT, UI_MENU_VR_HANDEDNESS_RIGHT};
         opt_choice("NX2NAVI_VR_HANDEDNESS", UI_MENU_VR_HANDEDNESS, hands, 2, UI_MENU_VR_HANDEDNESS_DESC);
     }
+    {
+        static const UiTextId plays[] = {UI_MENU_VR_PLAY_STATIONARY, UI_MENU_VR_PLAY_MOTION};
+        opt_choice("NX2NAVI_VR_PLAY", UI_MENU_VR_PLAY, plays, 2, UI_MENU_VR_PLAY_DESC);
+    }
     opt_slider("NX2NAVI_VR_SWING_SPEED", UI_MENU_VR_SWING_SPEED, 100, 500, UI_MENU_VR_SWING_SPEED_DESC, 10, "%.0f cm/s");
     opt_slider("NX2NAVI_VR_CHARGE_REACH", UI_MENU_VR_CHARGE_REACH, 25, 70, UI_MENU_VR_CHARGE_REACH_DESC, 1, "%.0f cm");
     opt_slider("NX2NAVI_VR_RUN_ZONE", UI_MENU_VR_RUN_ZONE, 0, 20, UI_MENU_VR_RUN_ZONE_DESC, 1, "%.0f degrees");

@@ -101,6 +101,9 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_VR_RUN_ZONE_DESC] = "Running forward in first person, Link runs dead straight while your head is within this "
         "many degrees of looking straight ahead; turn it further and he follows your head. 0: he always follows your "
         "head. Standing still, strafing and backing up are never affected.",
+    [UI_MENU_VR_PLAY] = "Play style", [UI_MENU_VR_PLAY_STATIONARY] = "Stationary", [UI_MENU_VR_PLAY_MOTION] = "Motion",
+    [UI_MENU_VR_PLAY_DESC] = "Stationary: Link's own gear and aiming, as on a pad. Motion (Meta/Oculus): the sword and "
+        "shield are held in your hands while Link has them out.",
     [UI_MENU_VR_SCALE] = "Field of view",
     [UI_MENU_VR_SCALE_DESC] = "How much of the world the view takes in. The default, 100%, matches the headset's lenses exactly. "
         "Higher fits more of the world into your view, so everything looks smaller; lower zooms in. Away from 100%, "

@@ -37,9 +37,13 @@ extern "C" {
 #include "vk_xr.h"
 #include "vr_game.h"
 #include "vr_wheel.h"
+#include "vr_model.h"
 #include "xr_aim_spv.h"
 #include "xr_depth_keep_spv.h"
 #include "xr_depth_spv.h"
+#include "xr_hand_fs_spv.h"
+#include "xr_hand_mix_spv.h"
+#include "xr_hand_vs_spv.h"
 #include "xr_hud_spv.h"
 int vk_dlaa_vr_planes(float planes[2]);                     // vk_dlaa.h
 void rec_drain(void);                                        // vk_rec.h
@@ -181,6 +185,24 @@ struct Xr {
     VkPipeline depth_pipe = VK_NULL_HANDLE;
     VkSampler linear = VK_NULL_HANDLE;
     bool depth_tried = false;
+    // VR's hands (NX2NAVI_VR_PLAY=motion, hud_mu): the game's models of the sword and the shield drawn at the hands
+    // (shaders/xr_hand_vs.vert, xr_hand_fs.frag) and put into scene8 and the kept depth (xr_hand_mix.comp)
+    struct HandItem {
+        VrModel cpu{};
+        VkBuffer vb = VK_NULL_HANDLE, ib = VK_NULL_HANDLE, staging = VK_NULL_HANDLE;
+        VkImage tex = VK_NULL_HANDLE;
+        VkImageView tex_view = VK_NULL_HANDLE;
+        bool uploaded = false;
+    } items[2];   // 0 the sword, 1 the shield
+    std::atomic<int> items_state{0};   // 0 not read, 1 reading, 2 read (items[].cpu, the model worker's until then)
+    VkDescriptorSetLayout hand_set = VK_NULL_HANDLE, mix_set = VK_NULL_HANDLE;
+    VkPipelineLayout hand_layout = VK_NULL_HANDLE, mix_layout = VK_NULL_HANDLE;
+    VkPipeline hand_pipe = VK_NULL_HANDLE, mix_pipe = VK_NULL_HANDLE;
+    VkImage hand_color = VK_NULL_HANDLE, hand_dist = VK_NULL_HANDLE, hand_depth = VK_NULL_HANDLE;
+    VkImageView hand_color_view = VK_NULL_HANDLE, hand_dist_view = VK_NULL_HANDLE, hand_depth_view = VK_NULL_HANDLE;
+    uint32_t hand_w = 0, hand_h = 0;
+    VkSampler hand_sampler = VK_NULL_HANDLE;
+    bool hand_tried = false;
     // the aiming reticle (shaders/xr_aim.comp, hud_mu) drawn into scene8 where the aim lands
     VkDescriptorSetLayout aim_set = VK_NULL_HANDLE;
     VkPipelineLayout aim_layout = VK_NULL_HANDLE;
@@ -425,9 +447,14 @@ bool make_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = mr.size, ai.memoryTypeIndex = type;
     VkDeviceMemory dm = VK_NULL_HANDLE;
-    if (type == UINT32_MAX || vkAllocateMemory(x.device, &ai, nullptr, &dm) != VK_SUCCESS ||
-        vkBindImageMemory(x.device, image, dm, 0) != VK_SUCCESS)
+    VkResult ar = type == UINT32_MAX ? VK_ERROR_OUT_OF_DEVICE_MEMORY : vkAllocateMemory(x.device, &ai, nullptr, &dm);
+    // the card's memory full (the game keeps it so): any other type the image may live in, the system's memory among them
+    for (uint32_t i = 0; i < mem.memoryTypeCount && ar != VK_SUCCESS; i++)
+        if ((mr.memoryTypeBits & (1u << i)) && i != type) ai.memoryTypeIndex = i, ar = vkAllocateMemory(x.device, &ai, nullptr, &dm);
+    if (ar != VK_SUCCESS || vkBindImageMemory(x.device, image, dm, 0) != VK_SUCCESS) {
+        rt_log("vr: an image %ux%u (format %d) found no memory (%d)", w, h, (int)format, (int)ar);
         return false;
+    }
     VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vc.image = image, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = format, vc.subresourceRange = {aspect, 0, 1, 0, 1};
     return vkCreateImageView(x.device, &vc, nullptr, &view) == VK_SUCCESS;
@@ -755,6 +782,322 @@ void make_aim(VkCommandBuffer cb, const Drawn &d) {
     vkCmdPushConstants(cb, x.aim_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
     vkCmdDispatch(cb, 1, 1, 1);
     barrier(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+}
+
+
+// VR's hands: the game's models of the sword and shield (vr_model.c), read once on a worker
+const char *const hand_actors[2] = {"Weapon_Sword_Kokiri", "Weapon_Shield_Deku"};
+
+void read_hand_models(void *) {
+    Xr &x = xr();
+    for (int i = 0; i < 2; i++) vr_model_load(hand_actors[i], &x.items[i].cpu);
+    x.items_state.store(2);
+}
+
+// A host-visible buffer of n bytes holding `data`
+bool make_host_buffer(VkDeviceSize n, VkBufferUsageFlags usage, const void *data, VkBuffer &buf) {
+    Xr &x = xr();
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = n, bi.usage = usage;
+    if (vkCreateBuffer(x.device, &bi, nullptr, &buf) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(x.device, buf, &mr);
+    VkPhysicalDeviceMemoryProperties mem;
+    vkGetPhysicalDeviceMemoryProperties(x.phys, &mem);
+    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < mem.memoryTypeCount && type == UINT32_MAX; i++)
+        if ((mr.memoryTypeBits & (1u << i)) && (mem.memoryTypes[i].propertyFlags & want) == want) type = i;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size, ai.memoryTypeIndex = type;
+    VkDeviceMemory dm = VK_NULL_HANDLE;
+    void *at = nullptr;
+    if (type == UINT32_MAX || vkAllocateMemory(x.device, &ai, nullptr, &dm) != VK_SUCCESS ||
+        vkBindBufferMemory(x.device, buf, dm, 0) != VK_SUCCESS || vkMapMemory(x.device, dm, 0, n, 0, &at) != VK_SUCCESS)
+        return false;
+    std::memcpy(at, data, (size_t)n);
+    return true;
+}
+
+// The model's buffers and texture on the card; the texture's copy recorded into cb
+bool upload_item(VkCommandBuffer cb, Xr::HandItem &it) {
+    const VrModel &m = it.cpu;
+    if (!m.verts || !m.rgba) return false;
+    const VkDeviceSize tn = (VkDeviceSize)m.tex_w * m.tex_h * 4;
+    if (!make_host_buffer(sizeof(float) * 8 * m.verts_n, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, m.verts, it.vb) ||
+        !make_host_buffer(sizeof(uint32_t) * m.index_n, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, m.index, it.ib) ||
+        !make_host_buffer(tn, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, m.rgba, it.staging) ||
+        !make_image(m.tex_w, m.tex_h, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                    it.tex, it.tex_view))
+        return false;
+    barrier(cb, it.tex, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkBufferImageCopy c{};
+    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    c.imageExtent = {m.tex_w, m.tex_h, 1};
+    vkCmdCopyBufferToImage(cb, it.staging, it.tex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    barrier(cb, it.tex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    it.uploaded = true;
+    return true;
+}
+
+VkShaderModule shader(const uint32_t *code, size_t n) {
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = n, mi.pCode = code;
+    VkShaderModule m = VK_NULL_HANDLE;
+    vkCreateShaderModule(xr().device, &mi, nullptr, &m);
+    return m;
+}
+
+// The hands' drawing pipeline (a model's vertices, its texture by push descriptor, two colour targets and a reversed
+// depth) and the compute that puts them into the scene
+bool make_hand_pipelines() {
+    Xr &x = xr();
+    if (!x.push_set || !x.nearest) return false;
+    VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    if (vkCreateSampler(x.device, &si, nullptr, &x.hand_sampler) != VK_SUCCESS) return false;
+    {
+        const VkDescriptorSetLayoutBinding b{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 1, li.pBindings = &b;
+        if (vkCreateDescriptorSetLayout(x.device, &li, nullptr, &x.hand_set) != VK_SUCCESS) return false;
+        const VkPushConstantRange pr{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(float) * 32};
+        VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pi.setLayoutCount = 1, pi.pSetLayouts = &x.hand_set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
+        if (vkCreatePipelineLayout(x.device, &pi, nullptr, &x.hand_layout) != VK_SUCCESS) return false;
+        const VkShaderModule vs = shader(xr_hand_vs_spv, sizeof xr_hand_vs_spv), fs = shader(xr_hand_fs_spv, sizeof xr_hand_fs_spv);
+        if (!vs || !fs) return false;
+        VkPipelineShaderStageCreateInfo st[2]{};
+        st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main", nullptr};
+        st[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main", nullptr};
+        const VkVertexInputBindingDescription vb{0, sizeof(float) * 8, VK_VERTEX_INPUT_RATE_VERTEX};
+        const VkVertexInputAttributeDescription va[3] = {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},
+                                                         {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 12},
+                                                         {2, 0, VK_FORMAT_R32G32_SFLOAT, 24}};
+        VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        vi.vertexBindingDescriptionCount = 1, vi.pVertexBindingDescriptions = &vb;
+        vi.vertexAttributeDescriptionCount = 3, vi.pVertexAttributeDescriptions = va;
+        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        vp.viewportCount = vp.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rs.polygonMode = VK_POLYGON_MODE_FILL, rs.cullMode = VK_CULL_MODE_NONE, rs.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        ds.depthTestEnable = ds.depthWriteEnable = VK_TRUE, ds.depthCompareOp = VK_COMPARE_OP_GREATER;   // reversed
+        VkPipelineColorBlendAttachmentState cba[2]{};
+        cba[0].colorWriteMask = cba[1].colorWriteMask = 0xf;
+        VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        cb.attachmentCount = 2, cb.pAttachments = cba;
+        const VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dy.dynamicStateCount = 2, dy.pDynamicStates = dyn;
+        const VkFormat colors[2] = {VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R16_SFLOAT};
+        VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        ri.colorAttachmentCount = 2, ri.pColorAttachmentFormats = colors, ri.depthAttachmentFormat = VK_FORMAT_D16_UNORM;
+        VkGraphicsPipelineCreateInfo gi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        gi.pNext = &ri, gi.stageCount = 2, gi.pStages = st, gi.pVertexInputState = &vi, gi.pInputAssemblyState = &ia;
+        gi.pViewportState = &vp, gi.pRasterizationState = &rs, gi.pMultisampleState = &ms, gi.pDepthStencilState = &ds;
+        gi.pColorBlendState = &cb, gi.pDynamicState = &dy, gi.layout = x.hand_layout;
+        const VkResult r = vkCreateGraphicsPipelines(x.device, VK_NULL_HANDLE, 1, &gi, nullptr, &x.hand_pipe);
+        vkDestroyShaderModule(x.device, vs, nullptr), vkDestroyShaderModule(x.device, fs, nullptr);
+        if (r != VK_SUCCESS) return false;
+    }
+    const VkDescriptorSetLayoutBinding b[5] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                               {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                               {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                               {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                               {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+    VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 5, li.pBindings = b;
+    if (vkCreateDescriptorSetLayout(x.device, &li, nullptr, &x.mix_set) != VK_SUCCESS) return false;
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(int32_t) * 6};
+    VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pi.setLayoutCount = 1, pi.pSetLayouts = &x.mix_set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
+    if (vkCreatePipelineLayout(x.device, &pi, nullptr, &x.mix_layout) != VK_SUCCESS) return false;
+    const VkShaderModule m = shader(xr_hand_mix_spv, sizeof xr_hand_mix_spv);
+    if (!m) return false;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", nullptr};
+    ci.layout = x.mix_layout;
+    const VkResult r = vkCreateComputePipelines(x.device, VK_NULL_HANDLE, 1, &ci, nullptr, &x.mix_pipe);
+    vkDestroyShaderModule(x.device, m, nullptr);
+    return r == VK_SUCCESS;
+}
+
+// 4x4 matrices by columns (as GLSL takes them)
+struct Mat4 {
+    float m[16];
+};
+Mat4 mul(const Mat4 &a, const Mat4 &b) {
+    Mat4 r{};
+    for (int c = 0; c < 4; c++)
+        for (int k = 0; k < 4; k++)
+            for (int i = 0; i < 4; i++) r.m[4 * c + i] += a.m[4 * k + i] * b.m[4 * c + k];
+    return r;
+}
+// a pose's rotation and position: what it holds to the space it is in
+Mat4 pose_matrix(const Pose &p) {
+    static const float ex[3] = {1, 0, 0}, ey[3] = {0, 1, 0}, ez[3] = {0, 0, 1};
+    float c[3][3];
+    rotate(p.q, ex, c[0]), rotate(p.q, ey, c[1]), rotate(p.q, ez, c[2]);
+    Mat4 r{};
+    for (int k = 0; k < 3; k++)
+        for (int i = 0; i < 3; i++) r.m[4 * k + i] = c[k][i];
+    r.m[12] = p.p[0], r.m[13] = p.p[1], r.m[14] = p.p[2], r.m[15] = 1;
+    return r;
+}
+Mat4 inverse_rigid(const Mat4 &a) {
+    Mat4 r{};
+    for (int k = 0; k < 3; k++)
+        for (int i = 0; i < 3; i++) r.m[4 * k + i] = a.m[4 * i + k];
+    for (int i = 0; i < 3; i++) r.m[12 + i] = -(r.m[i] * a.m[12] + r.m[4 + i] * a.m[13] + r.m[8 + i] * a.m[14]);
+    r.m[15] = 1;
+    return r;
+}
+// The model held in the grip (OpenXR's grip, held pointing forward: -z forward through the fist from the little finger
+// to the thumb, x to the right, y up, on either hand): its axes and where its origin sits, in the grip
+Mat4 held(int item, int right_hand) {
+    Mat4 r{};
+    r.m[15] = 1;
+    if (item == 0) {   // the sword: the blade (+z) along the fist, its flat (y) across the palm, the grip's middle held
+        r.m[1] = 1;                 // model x -> grip y
+        r.m[4] = 1;                 // model y -> grip x
+        r.m[10] = -1;               // model z -> grip -z
+        r.m[14] = -0.20f;           // its grip (model z -0.2) at the hand
+    } else {   // the shield: its straps (x) down the grip, its face (+y) out from the back of the hand (the grip's left on
+               // the left hand, its right on the right), so the forearm brought across the body guards with it
+        const float s = right_hand ? 1.0f : -1.0f;
+        r.m[1] = -1;                // model x -> grip -y
+        r.m[4] = s;                 // model y -> grip -x on the left hand, +x on the right
+        r.m[10] = s;                // model z -> grip -z on the left hand, +z on the right
+        // then turned 10 degrees about the grip's z (through the fist), its face toward the knuckles
+        const float a = -s * 10.0f * 3.14159265f / 180.0f, c = std::cos(a), n = std::sin(a);
+        for (int k = 0; k < 3; k++) {
+            const float gx = r.m[4 * k], gy = r.m[4 * k + 1];
+            r.m[4 * k] = c * gx - n * gy, r.m[4 * k + 1] = n * gx + c * gy;
+        }
+    }
+    return r;
+}
+
+// (vk_xr_capture, hud_mu held, after make_panel, before make_eyes) the sword and shield drawn at the hands while Link
+// holds them out, with Play style Motion and the Touch controllers
+void make_hands(VkCommandBuffer cb, const Drawn &d) {
+    Xr &x = xr();
+    float planes[2];
+    if (!d.tracked || strcmp(cfg_value("NX2NAVI_VR_PLAY"), "motion") || strcmp(cfg_value("NX2NAVI_VR_CONTROLS"), "meta") ||
+        !x.weapon_out.load() || !x.depth_kept || !vk_dlaa_vr_planes(planes))
+        return;
+    int state = 0;
+    if (x.items_state.compare_exchange_strong(state, 1)) {
+        if (!plat_thread_spawn(read_hand_models, nullptr, "vr-models", 0)) read_hand_models(nullptr);
+        return;
+    }
+    if (state != 2) return;
+    if (!x.hand_tried) {
+        x.hand_tried = true;
+        if (!make_hand_pipelines()) {
+            rt_log("vr: hands: the pipelines could not be made");
+            x.hand_pipe = x.mix_pipe = VK_NULL_HANDLE;
+        }
+    }
+    if (!x.hand_pipe || !x.mix_pipe) return;
+    Pose grips[2];
+    bool ok[2];
+    {
+        std::lock_guard<std::mutex> lk(x.hands_mu);
+        for (int h = 0; h < 2; h++) grips[h] = x.grip[h], ok[h] = x.grip_ok[h];
+    }
+    // the models drawn at three quarters of the scene's size (the card's memory is scarce), filtered up into it
+    const uint32_t hw = std::max(1u, x.hud_w * 3 / 4), hh = std::max(1u, x.hud_h * 3 / 4);
+    if (!x.hand_color || x.hand_w != hw || x.hand_h != hh) {   // (another size's are left behind)
+        const VkImageUsageFlags u = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        if (!make_image(hw, hh, VK_FORMAT_R8G8B8A8_SRGB, u, x.hand_color, x.hand_color_view) ||
+            !make_image(hw, hh, VK_FORMAT_R16_SFLOAT, u, x.hand_dist, x.hand_dist_view) ||
+            !make_image(hw, hh, VK_FORMAT_D16_UNORM, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, x.hand_depth,
+                        x.hand_depth_view, VK_IMAGE_ASPECT_DEPTH_BIT)) {
+            rt_log("vr: hands: targets %ux%u could not be made", hw, hh);
+            x.hand_pipe = VK_NULL_HANDLE;
+            return;
+        }
+        x.hand_w = hw, x.hand_h = hh;
+    }
+    for (auto &it : x.items)
+        if (!it.uploaded && it.cpu.verts && !upload_item(cb, it)) it.cpu.verts = nullptr;   // (not again)
+    const int sword = strcmp(cfg_value("NX2NAVI_VR_HANDEDNESS"), "right") == 0 ? 1 : 0;
+    // the head's view (the picture's pose) and its lens: clip = (x / tan_x, -y / tan_y, near, -z), the depth reversed
+    const Mat4 view = inverse_rigid(pose_matrix(d.pose));
+    const float tx = d.lens.r * d.scale, ty = d.lens.u * d.scale, near = 0.01f;
+    Mat4 proj{};
+    proj.m[0] = 1.0f / tx, proj.m[5] = -1.0f / ty, proj.m[11] = -1.0f, proj.m[14] = near;
+    barrier(cb, x.hand_color, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    barrier(cb, x.hand_dist, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    barrier(cb, x.hand_depth, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+    VkRenderingAttachmentInfo ca[2]{};
+    for (int i = 0; i < 2; i++) {
+        ca[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        ca[i].imageView = i ? x.hand_dist_view : x.hand_color_view;
+        ca[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    }
+    VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    da.imageView = x.hand_depth_view, da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, da.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    da.clearValue.depthStencil = {0.0f, 0};
+    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    ri.renderArea = {{0, 0}, {x.hand_w, x.hand_h}}, ri.layerCount = 1;
+    ri.colorAttachmentCount = 2, ri.pColorAttachments = ca, ri.pDepthAttachment = &da;
+    vkCmdBeginRendering(cb, &ri);
+    const VkViewport vp{0, 0, (float)x.hand_w, (float)x.hand_h, 0, 1};
+    const VkRect2D sc{{0, 0}, {x.hand_w, x.hand_h}};
+    vkCmdSetViewport(cb, 0, 1, &vp), vkCmdSetScissor(cb, 0, 1, &sc);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, x.hand_pipe);
+    for (int i = 0; i < 2; i++) {
+        const Xr::HandItem &it = x.items[i];
+        const int hand = i == 0 ? sword : 1 - sword;
+        if (!it.uploaded || !ok[hand]) continue;
+        const Mat4 mv = mul(view, mul(pose_matrix(grips[hand]), held(i, hand == 1)));
+        const Mat4 clip = mul(proj, mv);
+        float pc[32];
+        std::memcpy(pc, clip.m, sizeof clip.m), std::memcpy(pc + 16, mv.m, sizeof mv.m);
+        vkCmdPushConstants(cb, x.hand_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof pc, pc);
+        const VkDescriptorImageInfo ti{x.hand_sampler, it.tex_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstBinding = 0, w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, w.pImageInfo = &ti;
+        x.push_set(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, x.hand_layout, 0, 1, &w);
+        const VkDeviceSize zero = 0;
+        vkCmdBindVertexBuffers(cb, 0, 1, &it.vb, &zero);
+        vkCmdBindIndexBuffer(cb, it.ib, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cb, it.cpu.index_n, 1, 0, 0, 0);
+    }
+    vkCmdEndRendering(cb);
+    barrier(cb, x.hand_color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+    barrier(cb, x.hand_dist, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.mix_pipe);
+    const VkDescriptorImageInfo info[4] = {{x.hand_sampler, x.hand_color_view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {x.nearest, x.hand_dist_view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, x.scene8_view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, x.depth_view, VK_IMAGE_LAYOUT_GENERAL}};
+    const VkDescriptorBufferInfo rows{x.rows, 0, 8ull * x.depth_h};
+    VkWriteDescriptorSet w[5]{};
+    for (uint32_t i = 0; i < 5; i++) {
+        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, w[i].dstBinding = i, w[i].descriptorCount = 1;
+        w[i].descriptorType = i == 4 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                              : i < 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        if (i == 4) w[i].pBufferInfo = &rows;
+        else w[i].pImageInfo = &info[i];
+    }
+    x.push_set(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.mix_layout, 0, 5, w);
+    int32_t pc[6] = {(int32_t)x.hud_w, (int32_t)x.hud_h, (int32_t)x.depth_w, (int32_t)x.depth_h, 0, 0};
+    std::memcpy(&pc[4], &planes[0], 4), std::memcpy(&pc[5], &planes[1], 4);
+    vkCmdPushConstants(cb, x.mix_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    vkCmdDispatch(cb, (x.hud_w + 7) / 8, (x.hud_h + 7) / 8, 1);
+    barrier(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    barrier(cb, x.depth, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
 }
 
 // (vk_xr_capture, hud_mu held, after make_panel) each eye's picture from the scene make_panel left in scene8 and this
@@ -1961,7 +2304,7 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
         const bool wheel = vk_xr_wheel(&wheel_slot) || plat_now_ns() - x.wheel_closed_at.load() < wheel_hide_ns;
         made = make_panel(cb, !panel && !wheel, d.aim && panel ? (int)(0.06f * (float)x.hud_h) : 0);
         hw = x.hud_w, hh = x.hud_h;
-        if (made) make_aim(cb, d);
+        if (made) make_aim(cb, d), make_hands(cb, d);
         if (made && depth) d.stereo = make_eyes(cb, d);
     }
     d.hud = made && panel;
