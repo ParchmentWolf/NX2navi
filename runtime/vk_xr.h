@@ -45,6 +45,13 @@ int vk_xr_lens(float *angle);
 // (left[2], right[2]: x, y, up +y, -32767..32767) replaced by the controller's where it is pushed farther; 1 when a
 // controller is in use now
 int vk_xr_pad(uint64_t *buttons, int32_t left[2], int32_t right[2]);
+// ui/menu.cpp, each frame: the wheel open (NX2NAVI_VR_CONTROLS=meta): 1 the D-pad's (the left trigger held), 2 the
+// items' (the right trigger), 0 none; *slot the slot that hand's stick is held toward (0 up, clockwise; -1 none)
+int vk_xr_wheel(int *slot);
+// vr_game.c, the game's thread: a wheel's slot used since the last call (kind as vk_xr_wheel's), 0 none; and whether
+// a wheel may open now (not while the game's own menus pause it)
+int vk_xr_wheel_used(int *kind, int *slot);
+void vk_xr_wheel_allow(int allow);
 // The game's own view this frame (the head's view not applied); its pictures go on the screen
 void vk_xr_untracked(void);
 

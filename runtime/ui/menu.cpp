@@ -61,6 +61,8 @@ extern "C" {
 #include "ui_text.h"
 #include "vk_dlssg.h"
 #include "vk_lowlat.h"
+#include "vk_xr.h"
+#include "vr_wheel.h"
 // host.h and vk.h pull in cpu.h, which is C only: the functions the menu needs from them, as declared there.
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void vk_queue_lock(void);
@@ -369,7 +371,7 @@ static int vk_up(const MenuTarget *t) {
     ii.Device = t->device;
     ii.QueueFamily = t->queue_family;
     ii.Queue = t->queue;
-    ii.DescriptorPoolSize = 32;   // the art's sets, and two font atlases while one replaces the other
+    ii.DescriptorPoolSize = 128;   // the art's sets, two font atlases while one replaces the other, VR's wheels' icons (64)
     ii.CheckVkResultFn = menu_vk_check;
     ii.MinImageCount = 2;
     ii.ImageCount = 4;   // vertex buffers rotate per recorded frame: more than gfx_present.c's 2 frames in flight
@@ -2183,6 +2185,86 @@ int menu_perf_rect(int r[4]) {
     return 1;
 }
 
+// VR's wheels (vk_xr.cpp vk_xr_wheel: a Touch trigger held) around the middle of the window, slot 0 up and clockwise
+// (vr_wheel.c: kind 1 the D-pad's four actions, 2 the items): each slot the game's icon of what it holds, empty when
+// the save does not own it; the slot the stick is held toward lit, its icon large in the middle. vk_xr.cpp copies the
+// disc onto the middle of the HUD.
+static float g_wheel_rect[4];   // the disc's square this frame (menu_wheel_rect); width 0: not drawn
+static float g_wheel_label[4];  // the hovered item's name under it (menu_wheel_label); width 0: none
+static bool icon_tex(const VrIcon &ic, ImTextureID *tex) {
+    if (!strcmp(ic.tex, "HUDNaviIcon_Body_00")) return menu_art(MENU_ART_NAVI_ICON, tex, nullptr, nullptr) != 0;
+    return menu_icon(ic.file, ic.tex, tex) != 0;
+}
+// a slot's icon centred on p, size wide, and its small icons along its bottom (the one in use framed)
+static void slot_draw(ImDrawList *dl, const VrSlot &s, ImVec2 p, float size) {
+    ImTextureID tex;
+    const float h = size * 0.5f;
+    if (icon_tex(s.main, &tex)) dl->AddImage(tex, ImVec2(p.x - h, p.y - h), ImVec2(p.x + h, p.y + h));
+    if (!s.minis) return;
+    const float m = size * (s.mini_selected >= 0 ? 0.3f : 0.42f), gap = m * 0.08f;
+    const float row = s.minis * m + (s.minis - 1) * gap;
+    float x = p.x - row * 0.5f;
+    const float y = p.y + h - m * 0.75f;
+    for (int i = 0; i < s.minis; i++, x += m + gap) {
+        if (icon_tex(s.mini[i], &tex)) dl->AddImage(tex, ImVec2(x, y), ImVec2(x + m, y + m));
+        if (i == s.mini_selected)
+            dl->AddRect(ImVec2(x - 1, y - 1), ImVec2(x + m + 1, y + m + 1), IM_COL32(255, 255, 255, 255), 0, 0, 2.0f);
+    }
+}
+static void wheel_draw(const MenuTarget *t, float scale, int kind, int picked) {
+    const int n = vr_wheel_slots(kind);
+    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    const float w = (float)t->width, h = (float)t->height;
+    const ImVec2 c(w * 0.5f, h * 0.5f);
+    const float R = 0.36f * (w < h ? w : h), r = 0.34f * R, pi = 3.14159265f, step = 2 * pi / n;
+    dl->AddCircleFilled(c, R, IM_COL32(24, 18, 12, 235), 96);
+    const auto at = [&](float a, float rad) { return ImVec2(c.x + sinf(a) * rad, c.y - cosf(a) * rad); };
+    // each slot's icon as large as fits between its lines and the rings
+    const float mid = 0.5f * (R + r), chord = 2 * mid * sinf(step * 0.5f);
+    const float icon = 0.92f * (chord < R - r ? chord : R - r);
+    VrSlot s;
+    for (int i = 0; i < n; i++) {
+        const float a0 = (i - 0.5f) * step, a1 = (i + 0.5f) * step;
+        if (i == picked)
+            for (int k = 0; k < 12; k++) {
+                const float b0 = a0 + (a1 - a0) * k / 12, b1 = a0 + (a1 - a0) * (k + 1) / 12;
+                dl->AddQuadFilled(at(b0, r), at(b0, R - 2), at(b1, R - 2), at(b1, r), IM_COL32(150, 112, 50, 235));
+            }
+        dl->AddLine(at(a0, r), at(a0, R), SKIN_GOLD, 2.0f);
+        if (vr_wheel_slot(kind, i, &s)) slot_draw(dl, s, at(i * step, mid), icon);
+    }
+    dl->AddCircle(c, R - 1, SKIN_GOLD, 96, 3.0f);
+    dl->AddCircle(c, r, SKIN_GOLD, 64, 2.0f);
+    g_wheel_rect[0] = c.x - R, g_wheel_rect[1] = c.y - R, g_wheel_rect[2] = g_wheel_rect[3] = 2 * R;
+    g_wheel_label[2] = 0;
+    if (picked < 0 || !vr_wheel_slot(kind, picked, &s)) return;
+    {   // the middle: only what the release equips
+        VrSlot only = {};
+        only.main = s.now;
+        slot_draw(dl, only, c, 1.35f * r);
+    }
+    if (!s.label) return;
+    // the name on a small panel under the disc, as the game names the item under its own bar
+    const ImVec2 ts = ImGui::CalcTextSize(s.label);
+    const float padx = 14 * scale, pady = 7 * scale;
+    const ImVec2 a(c.x - ts.x * 0.5f - padx, c.y + R + 8 * scale), b(c.x + ts.x * 0.5f + padx, a.y + ts.y + 2 * pady);
+    skin_panel(dl, a, b, scale * 0.6f, 0.9f);
+    dl->AddText(ImVec2(a.x + padx, a.y + pady), SKIN_TEXT, s.label);
+    g_wheel_label[0] = a.x, g_wheel_label[1] = a.y, g_wheel_label[2] = b.x - a.x, g_wheel_label[3] = b.y - a.y;
+}
+
+int menu_wheel_rect(int r[4]) {
+    if (!(g_wheel_rect[2] > 0)) return 0;
+    for (int i = 0; i < 4; i++) r[i] = (int)(i < 2 ? floorf(g_wheel_rect[i]) : ceilf(g_wheel_rect[i]));
+    return 1;
+}
+
+int menu_wheel_label(int r[4]) {
+    if (!(g_wheel_rect[2] > 0) || !(g_wheel_label[2] > 0)) return 0;
+    for (int i = 0; i < 4; i++) r[i] = (int)(i < 2 ? floorf(g_wheel_label[i]) : ceilf(g_wheel_label[i]));
+    return 1;
+}
+
 // The note after F8 (bugcap.c): the capture's number and its folder's name for a few seconds, top centre, in the
 // menu's look. It shows once the capture is written, so the capture's own picture is without it.
 static void capture_note(const MenuTarget *t, float scale) {
@@ -2219,6 +2301,9 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
     int cap_number, cap_ok;
     char cap_name[64];
     const bool capture_shows = bugcap_note(&cap_number, &cap_ok, cap_name) != 0;   // the note after F8
+    g_wheel_rect[2] = 0;
+    int wheel_slot = -1;
+    const int wheel = g_open.load(std::memory_order_relaxed) ? 0 : vk_xr_wheel(&wheel_slot);   // VR's wheels
     if (g_booting.load(std::memory_order_relaxed)) g_booting.store(0, std::memory_order_release);   // the game runs
     bool open = g_open.load(std::memory_order_relaxed);
     // the frame the menu is first laid out after opening: also when its g_reset went to an earlier frame of the overlay
@@ -2236,7 +2321,7 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
             if (g_debug.load()) debug_menu_tab(0);
             set_open(1);
             open = true;
-        } else if (!g_perf_mode && !capture_shows) {
+        } else if (!g_perf_mode && !capture_shows && !wheel) {
             return 0;
         }
     }
@@ -2301,6 +2386,7 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
         layout_menu(t->width, t->height, scale);
     }
     perf_draw(t, scale);
+    if (wheel && !open) wheel_draw(t, scale, wheel, wheel_slot);
     capture_note(t, scale);
     ImGui::Render();
     if (open) g_save_pending = opt_save_tick(0);

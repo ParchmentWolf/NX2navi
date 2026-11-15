@@ -9,6 +9,7 @@ void dbg_tick(Cpu *c);                 // the game's thread, at its pad read (ov
 // ... and the pad's state before the game gets it: the free camera takes the sticks and four buttons while it flies
 void dbg_pad(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry);
 void dbg_freecam_host(Cpu *c);         // the free camera's patch site (recomp/patches-v111.txt, set freecam)
+void dbg_enum_set(Cpu *c, const char *name, const char *value);   // the game's thread: an enum of the game data
 #endif
 
 #ifdef __cplusplus
@@ -92,6 +93,9 @@ int dbg_freeze(uint64_t addr, uint64_t value, int size, int on);   // written ev
 int dbg_frozen(uint64_t addr);
 int dbg_frozen_count(void);
 void dbg_unfreeze_all(void);
+// The game data's ints and enums by name (any thread reads; dbg_enum_set the game's thread): 0 when there is none
+int dbg_int_get(const char *name, int32_t *v);
+int dbg_enum_get(const char *name, uint32_t *value_hash);
 #ifdef __cplusplus
 }
 #endif

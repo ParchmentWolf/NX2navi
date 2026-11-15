@@ -36,6 +36,7 @@ extern "C" {
 #include "ui/menu.h"
 #include "vk_xr.h"
 #include "vr_game.h"
+#include "vr_wheel.h"
 #include "xr_depth_keep_spv.h"
 #include "xr_depth_spv.h"
 #include "xr_hud_spv.h"
@@ -76,6 +77,10 @@ struct Drawn {
     float scale = 1.0f;    // the lens the game drew with over the one shown (NX2NAVI_VR_VIEW_SCALE)
     float ipd = 0.064f;    // the eyes' distance, metres
 };
+
+// after one of VR's wheels closes, the game's HUD stays off the HUD's panel this long: the game's own quick select, held
+// while a wheel is open, is going away
+constexpr uint64_t wheel_hide_ns = 400000000ull;
 
 struct Xr {
     bool tried = false, ok = false;
@@ -180,6 +185,11 @@ struct Xr {
     Pose grip[2];
     bool grip_ok[2]{};
     uint64_t hands_at = 0;   // when they were last read (plat_now_ns), 0 never
+    int wheel_open = 0;    // a trigger held: 1 the left's D-pad wheel, 2 the right's item wheel (ui/menu.cpp draws them)
+    int wheel_slot = -1;   // the slot its hand's stick points at (0 up, clockwise), -1 none
+    int used_kind = 0, used_slot = -1;   // a wheel's slot used at its trigger's release, until vk_xr_wheel_used takes it
+    std::atomic<bool> wheel_allowed{true};   // vr_game.c: the game is not paused by its own menus
+    std::atomic<uint64_t> wheel_closed_at{0};   // plat_now_ns at a wheel's close
     // the last picture drawn from the head whose world scene8 and eye8 still hold (the present's thread alone): a paused
     // game's menus go on the HUD's panel in front of that world, frozen as it was
     Drawn frozen;
@@ -533,15 +543,28 @@ bool make_panel(VkCommandBuffer cb, bool keep_hud) {
 // (vk_xr_capture, a picture from the head) the performance overlay (ui/menu.cpp menu_perf_rect), drawn on the window
 // over the picture, copied from the window to the top middle of the HUD's panel, its size there as on the window; the
 // HUD box made a clear panel first when the picture has none
+// The window's rect r ({x, y, w, h}) clipped to it into [x0, y0, x1, y1); false when nothing is left
+bool clip_rect(const int r[4], VkExtent2D extent, int out[4]) {
+    out[0] = std::max(r[0], 0), out[1] = std::max(r[1], 0);
+    out[2] = std::min(r[0] + r[2], (int)extent.width), out[3] = std::min(r[1] + r[3], (int)extent.height);
+    return out[2] > out[0] && out[3] > out[1];
+}
+
+// The host's own overlays drawn into the window (ui/menu.cpp) onto the HUD's box: the performance overlay at the top
+// middle, the item wheel (a disc, copied in rows of its width so the picture around it stays out) in the middle. Without
+// a HUD box this frame (d.hud and d.menu false) one is made clear first.
 void overlay_onto_hud(VkCommandBuffer cb, int slot, VkImage window, VkExtent2D extent, Drawn &d) {
     Xr &x = xr();
-    int r[4];
-    if (!menu_perf_rect(r)) return;
-    const int x0 = std::max(r[0], 0), y0 = std::max(r[1], 0);
-    const int x1 = std::min(r[0] + r[2], (int)extent.width), y1 = std::min(r[1] + r[3], (int)extent.height);
-    if (x1 <= x0 || y1 <= y0) return;
+    int r[4], perf[4] = {}, wheel[4] = {};
+    const bool has_perf = menu_perf_rect(r) && clip_rect(r, extent, perf);
+    const bool has_wheel = menu_wheel_rect(r) && clip_rect(r, extent, wheel);
+    int label[4] = {};
+    const bool has_label = has_wheel && menu_wheel_label(r) && clip_rect(r, extent, label);
+    // a wheel open, or one closed a moment ago: the game's HUD left off (its quick select, held meanwhile, going away)
+    const bool hide = has_wheel || plat_now_ns() - x.wheel_closed_at.load() < wheel_hide_ns;
+    if (!has_perf && !has_wheel && !hide) return;
     const VkImage hb = x.hud_boxes[slot];
-    const bool fresh = !d.hud && !d.menu;
+    const bool fresh = (!d.hud && !d.menu) || hide;
     barrier(cb, hb, fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     if (fresh) {
         const VkClearColorValue clear{};
@@ -550,16 +573,56 @@ void overlay_onto_hud(VkCommandBuffer cb, int slot, VkImage window, VkExtent2D e
         barrier(cb, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     }
     const float sx = (float)x.width / (float)extent.width, sy = (float)x.height / (float)extent.height;
-    const int w = std::max(1, (int)((x1 - x0) * sx)), h = std::max(1, (int)((y1 - y0) * sy));
-    const int dx = ((int)x.width - w) / 2, dy = (int)(0.03f * (float)x.height);
     VkImageBlit b{};
     b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    b.srcOffsets[0] = {x0, y0, 0}, b.srcOffsets[1] = {x1, y1, 1};
-    b.dstOffsets[0] = {dx, dy, 0}, b.dstOffsets[1] = {std::min(dx + w, (int)x.width), std::min(dy + h, (int)x.height), 1};
-    vkCmdBlitImage(cb, window, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
-                   VK_FILTER_LINEAR);
+    if (has_perf) {
+        const int x0 = perf[0], y0 = perf[1], x1 = perf[2], y1 = perf[3];
+        const int w = std::max(1, (int)((x1 - x0) * sx)), h = std::max(1, (int)((y1 - y0) * sy));
+        const int dx = ((int)x.width - w) / 2, dy = (int)(0.03f * (float)x.height);
+        b.srcOffsets[0] = {x0, y0, 0}, b.srcOffsets[1] = {x1, y1, 1};
+        b.dstOffsets[0] = {dx, dy, 0}, b.dstOffsets[1] = {std::min(dx + w, (int)x.width), std::min(dy + h, (int)x.height), 1};
+        vkCmdBlitImage(cb, window, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
+                       VK_FILTER_LINEAR);
+    }
+    if (has_wheel) {   // the disc's rows, each its chord's width, its middle onto the box's middle
+        const float s = std::min(sx, sy);
+        const float cx = 0.5f * (float)(wheel[0] + wheel[2]), cy = 0.5f * (float)(wheel[1] + wheel[3]);
+        const float rad = 0.5f * (float)std::min(wheel[2] - wheel[0], wheel[3] - wheel[1]);
+        const float dcx = 0.5f * (float)x.width, dcy = 0.5f * (float)x.height;
+        constexpr int rows = 96;
+        VkImageBlit bands[rows];
+        int n = 0;
+        for (int i = 0; i < rows; i++) {
+            const float y0 = cy - rad + 2.0f * rad * (float)i / rows, y1 = cy - rad + 2.0f * rad * (float)(i + 1) / rows;
+            const float mid = 0.5f * (y0 + y1) - cy;   // the chord at the band's middle
+            const float half = std::sqrt(std::max(0.0f, rad * rad - mid * mid));
+            const int sx0 = (int)std::floor(cx - half), sx1 = (int)std::ceil(cx + half);
+            const int sy0 = (int)std::floor(y0), sy1 = (int)std::ceil(y1);
+            if (sx1 <= sx0 || sy1 <= sy0) continue;
+            VkImageBlit &k = bands[n++];
+            k = b;
+            k.srcOffsets[0] = {sx0, sy0, 0}, k.srcOffsets[1] = {sx1, sy1, 1};
+            const auto dst_x = [&](float v) { return std::clamp((int)std::lround(dcx + (v - cx) * s), 0, (int)x.width); };
+            const auto dst_y = [&](float v) { return std::clamp((int)std::lround(dcy + (v - cy) * s), 0, (int)x.height); };
+            k.dstOffsets[0] = {dst_x((float)sx0), dst_y((float)sy0), 0}, k.dstOffsets[1] = {dst_x((float)sx1), dst_y((float)sy1), 1};
+            if (k.dstOffsets[1].x <= k.dstOffsets[0].x || k.dstOffsets[1].y <= k.dstOffsets[0].y) n--;
+        }
+        if (n) vkCmdBlitImage(cb, window, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                              (uint32_t)n, bands, VK_FILTER_LINEAR);
+        if (has_label) {   // the hovered item's name under the disc, placed as in the window
+            VkImageBlit k = b;
+            const auto dst_x = [&](float v) { return std::clamp((int)std::lround(dcx + (v - cx) * s), 0, (int)x.width); };
+            const auto dst_y = [&](float v) { return std::clamp((int)std::lround(dcy + (v - cy) * s), 0, (int)x.height); };
+            k.srcOffsets[0] = {label[0], label[1], 0}, k.srcOffsets[1] = {label[2], label[3], 1};
+            k.dstOffsets[0] = {dst_x((float)label[0]), dst_y((float)label[1]), 0};
+            k.dstOffsets[1] = {dst_x((float)label[2]), dst_y((float)label[3]), 1};
+            if (k.dstOffsets[1].x > k.dstOffsets[0].x && k.dstOffsets[1].y > k.dstOffsets[0].y)
+                vkCmdBlitImage(cb, window, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                               &k, VK_FILTER_LINEAR);
+        }
+    }
     barrier(cb, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    if (fresh) d.hud = true;
+    if (fresh && !d.menu) d.hud = true;
 }
 
 // The depth stereo shader (shaders/xr_depth.comp): the scene and its depth sampled, the eye's RGBA8 image out
@@ -685,14 +748,28 @@ bool make_eyes(VkCommandBuffer cb, const Drawn &d) {
     return true;
 }
 
-// The session's thread: its events, the headset's frames, and each newer box into the swapchain
 // The hand controllers through OpenXR's actions, bound for the Touch controllers (Quest), read each headset frame onto
 // the pad's buttons (input_map.h bits): A and B their own, X and Y A and B again; the left stick's click A, the right's
-// X (jump); the left grip ZL (the Z lock), the right grip ZR; the triggers L and R; the left Menu tapped Plus (the
-// inventory), held a second Minus; the right hand swung fast Y (the sword) tapped, or held while the swing went outward
-// and left the hand out to the side (the charge), until the hand comes back in. NX2NAVI_VR_CONTROLS=meta puts them on the pad (vk_xr_pad); gamepad leaves the pad to the gamepad
+// X (jump); the left grip ZL (the Z lock), the right grip ZR; the left Menu tapped Plus (the inventory), held a second
+// Minus; the right hand swung fast Y (the sword) tapped, or held while the swing went outward and left the hand out to
+// the side (the charge), until the hand comes back in. The left trigger held opens the D-pad wheel, the right one the
+// item wheel (vr_wheel.c; ui/menu.cpp draws them): that hand's stick held toward a slot picks it and the trigger's
+// release uses it (the D-pad's direction pressed, or the item equipped by vr_game.c), a flick toward a slot swaps what
+// it holds. NX2NAVI_VR_CONTROLS=meta puts them on the pad (vk_xr_pad); gamepad leaves the pad to the gamepad.
 struct Controls {
-    enum { A = 0, B, X, Y, STICK_L, STICK_R, L, R, ZL, ZR, PLUS, MINUS };
+    enum { A = 0, B, X, Y, STICK_L, STICK_R, L, R, ZL, ZR, PLUS, MINUS, LEFT, UP, RIGHT, DOWN };
+    // the D-pad wheel's slots, 0 up and clockwise: the accessory, Navi, the boots, the ocarina
+    static constexpr int dpad_slots[4] = {UP, RIGHT, DOWN, LEFT};
+    int wheel = 0;
+    int wheel_slot = -1, dpad_bit = -1;
+    // a tap: the stick toward a slot and back to the middle within flick_ns steps the slot's variants (vr_wheel_tap)
+    static constexpr uint64_t flick_ns = 300000000ull;
+    int tap_slot = -1;
+    uint64_t tap_since = 0;
+    uint64_t dpad_from = 0, dpad_until = 0;
+    // after a wheel closes the D-pad's press waits this long: the game's own quick select, held while a wheel is open, is
+    // closing and would take it
+    static constexpr uint64_t after_dpad_ns = 200000000ull;
     static constexpr uint64_t press_ns = 120000000ull, hold_ns = 1000000000ull;
     XrActionSet set = XR_NULL_HANDLE;
     XrAction stick = XR_NULL_HANDLE, click = XR_NULL_HANDLE, trigger = XR_NULL_HANDLE, squeeze = XR_NULL_HANDLE,
@@ -828,7 +905,6 @@ struct Controls {
             trigger_on[h] = trigger_on[h] ? t > 0.4f : t > 0.6f;
             squeeze_on[h] = squeeze_on[h] ? s > 0.4f : s > 0.6f;
         }
-        set_bit(L, trigger_on[0]), set_bit(R, trigger_on[1]);
         set_bit(ZL, squeeze_on[0]), set_bit(ZR, squeeze_on[1]);
         // the Menu: a tap is Plus for a moment at its release, a second's hold Minus for a moment then
         if (on(session, menu, XR_NULL_PATH)) {
@@ -847,6 +923,36 @@ struct Controls {
             if (XR_SUCCEEDED(x.xrGetActionStateVector2f(session, &gi, &st)) && st.isActive)
                 sticks[h][0] = st.currentState.x, sticks[h][1] = st.currentState.y;
         }
+        // the wheel: open while a trigger is held; the right stick pushed past half picks the slot it points at, which
+        // stays picked when the stick comes back; the release uses it
+        int used_kind = 0, used_slot = -1;
+        if (wheel && !trigger_on[wheel - 1]) {   // its trigger let go: the slot held toward used
+            const bool usable = wheel_slot >= 0 && vr_wheel_usable(wheel, wheel_slot);   // an empty slot does nothing
+            if (wheel == VR_WHEEL_DPAD && usable)
+                dpad_bit = dpad_slots[wheel_slot], dpad_from = now + after_dpad_ns, dpad_until = dpad_from + press_ns;
+            x.wheel_closed_at.store(now);
+            if (usable) used_kind = wheel, used_slot = wheel_slot;
+            wheel = 0;
+        }
+        if (!wheel && (trigger_on[0] || trigger_on[1]) && x.wheel_allowed.load()) wheel = trigger_on[0] ? 1 : 2, tap_slot = -1;
+        const int was_slot = wheel_slot;
+        wheel_slot = -1;
+        if (wheel) {   // the wheel's own hand's stick picks
+            const int n = vr_wheel_slots(wheel);
+            const float sx = sticks[wheel - 1][0], sy = sticks[wheel - 1][1];
+            if (sx * sx + sy * sy > 0.25f) {
+                float a = std::atan2(sx, sy);   // 0 up, clockwise
+                if (a < 0) a += 2.0f * 3.14159265f;
+                wheel_slot = (int)std::floor(a / (2.0f * 3.14159265f / n) + 0.5f) % n;
+            }
+            if (wheel_slot >= 0 && wheel_slot != was_slot) tap_slot = wheel_slot, tap_since = now;
+            if (wheel_slot < 0 && tap_slot >= 0) {
+                if (now - tap_since < flick_ns) vr_wheel_tap(wheel, tap_slot);
+                tap_slot = -1;
+            }
+        }
+        if (now >= dpad_from && now < dpad_until) set_bit(dpad_bit, true);
+        set_bit(L, wheel != 0);   // the game's own quick select held meanwhile: it pauses the game (its menu not shown)
         Pose poses[2];
         bool pose_ok[2]{};
         for (int h = 0; h < 2; h++) {
@@ -899,6 +1005,8 @@ struct Controls {
         set_bit(Y, y_down != 0);
         std::lock_guard<std::mutex> lk(x.hands_mu);
         x.hand_buttons = bits;
+        x.wheel_open = wheel, x.wheel_slot = wheel_slot;
+        if (used_kind) x.used_kind = used_kind, x.used_slot = used_slot;
         std::memcpy(x.hand_sticks, sticks, sizeof sticks);
         for (int h = 0; h < 2; h++) x.grip[h] = poses[h], x.grip_ok[h] = pose_ok[h];
         x.hands_at = now;
@@ -917,6 +1025,7 @@ struct Controls {
     }
 };
 
+// The session's thread: its events, the headset's frames, and each newer box into the swapchain
 void run(void *) {
     Xr &x = xr();
     XrGraphicsBindingVulkanKHR binding{XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
@@ -1439,11 +1548,17 @@ extern "C" int vk_xr_pad(uint64_t *buttons, int32_t left[2], int32_t right[2]) {
     if (!x.ok || !x.running.load() || strcmp(cfg_value("NX2NAVI_VR_CONTROLS"), "meta") != 0) return 0;
     uint64_t bits;
     float sticks[2][2];
+    int wheel;
     {
         std::lock_guard<std::mutex> lk(x.hands_mu);
         if (!x.hands_at || plat_now_ns() - x.hands_at > 250000000ull) return 0;   // not read for a while: not focused
         bits = x.hand_buttons;
         std::memcpy(sticks, x.hand_sticks, sizeof sticks);
+        wheel = x.wheel_open;
+    }
+    if (wheel) {   // the wheel's hand's stick picks on it, not in the game
+        int32_t *s = wheel == 1 ? left : right;
+        sticks[wheel - 1][0] = sticks[wheel - 1][1] = 0, s[0] = s[1] = 0;
     }
     int used = bits != 0;
     int32_t *out[2] = {left, right};
@@ -1459,6 +1574,26 @@ extern "C" int vk_xr_pad(uint64_t *buttons, int32_t left[2], int32_t right[2]) {
     *buttons |= bits;
     return used;
 }
+
+extern "C" int vk_xr_wheel(int *slot) {
+    Xr &x = xr();
+    if (!x.ok || !x.running.load() || strcmp(cfg_value("NX2NAVI_VR_CONTROLS"), "meta") != 0) return 0;
+    std::lock_guard<std::mutex> lk(x.hands_mu);
+    if (!x.wheel_open || !x.hands_at || plat_now_ns() - x.hands_at > 250000000ull) return 0;
+    *slot = x.wheel_slot;
+    return x.wheel_open;
+}
+
+extern "C" int vk_xr_wheel_used(int *kind, int *slot) {
+    Xr &x = xr();
+    std::lock_guard<std::mutex> lk(x.hands_mu);
+    if (!x.used_kind) return 0;
+    *kind = x.used_kind, *slot = x.used_slot, x.used_kind = 0;
+    return 1;
+}
+
+extern "C" void vk_xr_wheel_allow(int allow) { xr().wheel_allowed.store(allow != 0); }
+
 
 extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3]) {
     Xr &x = xr();
@@ -1650,7 +1785,10 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
     uint32_t hw = 0, hh = 0;
     if (d.tracked && (panel || depth)) {
         std::lock_guard<std::mutex> lk(x.hud_mu);
-        made = make_panel(cb, !panel);
+        // a wheel open or just closed: the game's HUD left out of the picture too (only the wheel is shown, on the panel)
+        int wheel_slot;
+        const bool wheel = vk_xr_wheel(&wheel_slot) || plat_now_ns() - x.wheel_closed_at.load() < wheel_hide_ns;
+        made = make_panel(cb, !panel && !wheel);
         hw = x.hud_w, hh = x.hud_h;
         if (made && depth) d.stereo = make_eyes(cb, d);
     }

@@ -106,6 +106,7 @@ static void npad_states(Cpu *c, uint32_t want) {
     if (live) dbg_pad(&s.buttons, &s.lx, &s.ly, &s.rx, &s.ry);   // its free camera takes the sticks while it flies
     if (live) sprint_pad(&s.buttons);   // the sprint button's presses, kept from the game during gameplay (sprint.c)
     if (live) vr_pad(&s.buttons, s.lx, s.ly);   // VR's first person strafe (vr_game.c)
+    if (live) vr_tick(c);   // VR's wheels (vr_game.c)
     if (live) text_speed_poll();   // the text_speed setting onto the patch page (text_speed.c)
     *out = s;
     ret_x(c, 1);

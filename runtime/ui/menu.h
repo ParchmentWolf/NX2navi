@@ -29,6 +29,8 @@ void menu_perf_cycle(void);
 // Where the performance overlay was drawn in the last frame (x, y, width, height, window pixels): 0 when it was not
 // (vk_xr.cpp puts it on VR's HUD panel)
 int menu_perf_rect(int r[4]);               // F10: the performance overlay off, fps, full
+int menu_wheel_rect(int r[4]);   // VR's wheel's square in the window this frame (x, y, w, h); 0: not drawn
+int menu_wheel_label(int r[4]);  // the hovered item's name's panel under it (x, y, w, h); 0: none
 
 // ---- events from the window adapter, used only while the menu is open. key: an ImGuiKey; coordinates in pixels of the
 // window's client area, which is the swapchain image.

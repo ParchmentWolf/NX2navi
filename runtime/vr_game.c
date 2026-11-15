@@ -18,6 +18,7 @@
 #include "layout.h"
 #include "platform/platform.h"
 #include "vk_xr.h"
+#include "vr_wheel.h"
 #include "vr_game.h"
 
 static uint64_t head_camera;   // x19 of the update the head's view was put on (0: none); the game's thread alone
@@ -109,6 +110,27 @@ static int first_person_eye(double eye[3]) {
 // position in each row's fourth float). Its rotation is made the turn about the vertical toward the view. Running
 // forward, the game turns him toward his movement, which the head's view steers; sideways or back he strafes (vr_pad).
 static _Atomic uint64_t fp_at;   // when Link was last turned to the head in first person
+
+// The game's thread at each pad read: VR's wheels. While one is open vk_xr.cpp holds the game's own quick select (L),
+// which pauses the game; a wheel does not open while the game's menus pause it (its three pause steps' flags). An item
+// wheel's slot is equipped (its era's AssignableItem enum) a few reads after the release, once the quick select closed.
+void vr_tick(Cpu *c) {
+    int slot;
+    const int open = vk_xr_wheel(&slot) != 0;
+    int p = 0, pre = 0, post = 0;
+    dbg_flag_get("Sequence_IsPause", &p), dbg_flag_get("Sequence_IsPreGamePause", &pre);
+    dbg_flag_get("Sequence_IsPostGamePause", &post);
+    vk_xr_wheel_allow(open || !(p || pre || post));
+    static int pending_slot = -1, pending_wait;
+    int used_kind, used_slot;
+    if (vk_xr_wheel_used(&used_kind, &used_slot) && used_kind == VR_WHEEL_ITEMS) pending_slot = used_slot, pending_wait = 12;
+    if (pending_slot >= 0 && --pending_wait <= 0) {
+        const char *item = vr_wheel_equip(pending_slot);
+        const int child = vr_wheel_child();
+        if (item) dbg_enum_set(c, child ? "PlayerStatus.AssignableItem.Child" : "PlayerStatus.AssignableItem.Adult", item);
+        pending_slot = -1;
+    }
+}
 
 // ov_input.c npad_states: in first person play, while the left stick is pushed sideways or back the game gets ZL held,
 // so Link strafes as Z-targeting does, facing the way he faced (the head's, from running forward or standing). Pushed

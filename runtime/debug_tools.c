@@ -552,6 +552,21 @@ int dbg_texts(void (*cb)(uint32_t hash, const char *text, void *ctx), void *ctx)
 }
 uint32_t dbg_name_hash(const char *name) { return hash_of(name); }
 
+// An int (kind 2, entries of 0x28 bytes) or an enum (kind 6, 0x38 bytes, the value's name's hash) of the game data, its
+// value now at +0x1c. 0 when the game has no such entry.
+static void enum_set(Cpu *c, const char *name, const char *value);
+int dbg_int_get(const char *name, int32_t *v) {
+    uint64_t e = dbg_supported() ? gmd_entry(2, 0x28, hash_of(name)) : 0;
+    return e && rd(e + 0x1c, v, 4);
+}
+int dbg_enum_get(const char *name, uint32_t *value_hash) {
+    uint64_t e = dbg_supported() ? gmd_entry(6, 0x38, hash_of(name)) : 0;
+    return e && rd(e + 0x1c, value_hash, 4);
+}
+void dbg_enum_set(Cpu *c, const char *name, const char *value) {
+    if (dbg_supported() && gmd()) enum_set(c, name, value);
+}
+
 // One on/off flag of the game data by its name, as the game holds it now (kind 0: entries of 0x18 bytes, the value's
 // bit at +0x16, as dbg_flags_refresh reads them). 0 when the game has no such flag yet.
 int dbg_flag_get(const char *name, int *on) {

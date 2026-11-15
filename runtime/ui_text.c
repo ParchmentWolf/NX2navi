@@ -77,7 +77,10 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_VR_CONTROLS_PAD_DESC] = "Play with a normal controller (or the keyboard and mouse), as without VR.",
     [UI_MENU_VR_CONTROLS_META_DESC] = "Play with the headset's Touch controllers (a gamepad still works alongside). "
         "A/B: the game's own A/B. X/Y: mirror A/B. L3: mirrors A (roll, run, accept). R3: mirrors X (jump). "
-        "Triggers and grips: L/R and ZL/ZR. Menu pressed: + (primary menu). Menu held: - (secondary menu). "
+        "Grips: ZL/ZR. L trigger (held): the D-pad wheel. R trigger (held): the item wheel; the game waits meanwhile. "
+        "Hold that hand's stick toward a slot and release the trigger to use it; flick the stick toward a slot and let go "
+        "to swap what it holds (bombs or bombchus, the arrows, the seed or beans). Menu pressed: + (primary menu). "
+        "Menu held: - (secondary menu). "
         "Swinging the right hand: Y (sword).",
     [UI_MENU_VR_SWING_SPEED] = "Swing speed",
     [UI_MENU_VR_SWING_SPEED_DESC] = "How fast your hand must move for a swing to count as a sword slash (Meta/Oculus). "
