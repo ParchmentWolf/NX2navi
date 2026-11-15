@@ -127,15 +127,15 @@ static void link_state(char out[48]) {
     out[47] = 0;
 }
 
-// The game's thread at each pad read: whether Link plays the ocarina (his state DemoOcarina), and VR's wheels. While
-// one is open vk_xr.cpp holds the game's own quick select (L), which pauses the game. A wheel opens in play alone: the
+// The game's thread at each pad read: whether Link plays the ocarina (a DemoOcarina state, a lesson's too), and VR's
+// wheels. While one is open vk_xr.cpp holds the game's own quick select (L), which pauses the game. A wheel opens in play alone: the
 // gameplay camera updated a moment ago (not the title, a load, an event), Link there and not in one of his scripted
 // Demo states (the ocarina among them), and the game not paused by its menus (its three pause steps' flags). An item
 // wheel's slot is equipped (its era's AssignableItem enum) a few reads after the release, once the quick select closed.
 void vr_tick(Cpu *c) {
     char state[48];
     link_state(state);
-    vk_xr_ocarina(!strcmp(state, "DemoOcarina"));   // playing the ocarina
+    vk_xr_ocarina(!strncmp(state, "DemoOcarina", 11));   // playing the ocarina (a lesson's too)
     int slot;
     const int open = vk_xr_wheel(&slot) != 0;
     int p = 0, pre = 0, post = 0;
