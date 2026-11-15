@@ -1215,7 +1215,9 @@ bool make_eyes(VkCommandBuffer cb, const Drawn &d) {
 // item wheel (vr_wheel.c; ui/menu.cpp draws them): that hand's stick held toward a slot picks it and the trigger's
 // release uses it (the D-pad's direction pressed, or the item equipped by vr_game.c), a flick toward a slot swaps what
 // it holds. The shield hand's shield turned to face ahead before its own side's eye holds ZL (the Z lock), as Link
-// holds his shield. Both hands brought together behind the head draw the sword and shield (a tap of Y) or, while they are out,
+// holds his shield. Both arms shaken upward press the D-pad's down (the boots), both hands together before the face
+// its left (the ocarina), both hands beside the head its right (Navi), a hand shaken sideways above the head its up
+// (the mask). Both hands brought together behind the head draw the sword and shield (a tap of Y) or, while they are out,
 // put them away (B). While Link plays the ocarina (vk_xr_ocarina) the notes swap places: the right stick's left, up, right and
 // down play Y, X, A and R, the A button L; no sword, jump or wheel meanwhile. NX2NAVI_VR_CONTROLS=meta puts them on the
 // pad (vk_xr_pad); gamepad leaves the pad to the gamepad.
@@ -1261,8 +1263,17 @@ struct Controls {
     uint64_t y_down = 0, y_up = 0;   // the tap's press and release (0: none now)
     // the draw: both grips behind the head's eyes (behind_on), no lower than shoulder_drop under them and within
     // together_on of each other; once a draw, again only after the hands parted (apart_off) and refractory
-    static constexpr float behind_on = 0.03f, shoulder_drop = 0.30f, together_on = 0.25f, apart_off = 0.35f;
+    static constexpr float behind_on = 0.03f, shoulder_drop = 0.30f, together_on = 0.15f, apart_off = 0.35f;
     static constexpr uint64_t draw_refractory_ns = 800000000ull;
+    // the D-pad's gestures (in play): both arms shaken upward the boots (down), both hands together before the face the
+    // ocarina (left), both hands beside the head Navi (right), a hand shaken sideways above the head the mask (up); each
+    // once, then not again for dpad_refractory_ns; the poses held dwell_ns first
+    static constexpr uint64_t dpad_refractory_ns = 1000000000ull, dwell_ns = 250000000ull;
+    float hand_p[2][4][3]{};
+    uint64_t hand_t[2][4]{};
+    int hand_n[2]{};
+    uint64_t pose_since[2]{};   // the ocarina's and Navi's poses: held since (0 not held)
+    uint64_t dpad_gesture_at = 0;
     bool draw_armed = true;
     bool grip_zr[2]{};   // in play: the item button held by that grip (pressed behind the head, or with an item out)
     int tap_bit = Y;     // what the swing's tap presses: Y (the sword) or ZR (the hammer, the stick, an empty bottle)
@@ -1473,6 +1484,55 @@ struct Controls {
             }
             if (!draw_armed && (d2 > apart_off * apart_off || behind[0] < 0 || behind[1] < 0)) draw_armed = true;
         }
+        // the hands' velocities (over their last 4 frames) and places about the head: up, ahead (fwd) and to the right
+        float hv[2][3]{}, hspeed[2]{}, up[2]{}, fwd[2]{};
+        for (int h = 0; h < 2; h++) {
+            if (!pose_ok[h]) {
+                hand_n[h] = 0;
+                continue;
+            }
+            const int i = hand_n[h]++ & 3;
+            std::memcpy(hand_p[h][i], poses[h].p, sizeof hand_p[h][i]);
+            hand_t[h][i] = now;
+            up[h] = poses[h].p[1] - head[1], fwd[h] = -back_any[h];
+            if (hand_n[h] < 4) continue;
+            const int o = hand_n[h] & 3;
+            const float dt = (float)(hand_t[h][i] - hand_t[h][o]) * 1e-9f;
+            for (int c = 0; c < 3 && dt > 0; c++) hv[h][c] = (hand_p[h][i][c] - hand_p[h][o][c]) / dt;
+            hspeed[h] = std::sqrt(hv[h][0] * hv[h][0] + hv[h][1] * hv[h][1] + hv[h][2] * hv[h][2]);
+        }
+        const float shake = 0.008f * (float)cfg_int("NX2NAVI_VR_SWING_SPEED");   // 80% of a swing's speed, m/s
+        // both arms shaken upward together; a hand shaken (mostly sideways) above the head
+        const bool both_up = hspeed[0] > shake && hspeed[1] > shake && hv[0][1] > 0.7f * hspeed[0] && hv[1][1] > 0.7f * hspeed[1];
+        bool wave[2];
+        for (int h = 0; h < 2; h++)
+            wave[h] = pose_ok[h] && up[h] > 0.15f && hspeed[h] > shake &&
+                      hv[h][0] * hv[h][0] + hv[h][2] * hv[h][2] > 0.49f * hspeed[h] * hspeed[h];
+        // both hands together before the face (the ocarina held to the mouth); both beside the head (Navi called)
+        bool at_face = false, beside = false;
+        if (pose_ok[0] && pose_ok[1]) {
+            float d2 = 0;
+            for (int c = 0; c < 3; c++) d2 += (poses[0].p[c] - poses[1].p[c]) * (poses[0].p[c] - poses[1].p[c]);
+            at_face = d2 < 0.16f * 0.16f && fwd[0] > 0.06f && fwd[1] > 0.06f && fwd[0] < 0.21f && fwd[1] < 0.21f &&
+                      up[0] > -0.30f && up[1] > -0.30f && up[0] < 0.0f && up[1] < 0.0f &&
+                      std::fabs(0.5f * (side[0] + side[1])) < 0.12f;
+            beside = side[0] < -0.10f && side[0] > -0.35f && side[1] > 0.10f && side[1] < 0.35f && std::fabs(up[0]) < 0.15f &&
+                     std::fabs(up[1]) < 0.15f && std::fabs(fwd[0]) < 0.15f && std::fabs(fwd[1]) < 0.15f;
+        }
+        pose_since[0] = at_face ? (pose_since[0] ? pose_since[0] : now) : 0;
+        pose_since[1] = beside ? (pose_since[1] ? pose_since[1] : now) : 0;
+        if (in_play && !x.ocarina.load() && !wheel && now - dpad_gesture_at >= dpad_refractory_ns) {
+            int bit = -1;
+            if (both_up) bit = DOWN;
+            else if (wave[0] || wave[1]) bit = UP;
+            else if (pose_since[0] && now - pose_since[0] >= dwell_ns) bit = LEFT;
+            else if (pose_since[1] && now - pose_since[1] >= dwell_ns) bit = RIGHT;
+            if (bit >= 0) {
+                dpad_bit = bit, dpad_from = now, dpad_until = now + press_ns, dpad_gesture_at = now;
+                y_down = 0, charging = false, queued = false;   // the shake is not a swing
+                pose_since[0] = pose_since[1] = 0;
+            }
+        }
         // in play the grips are the item button alone (no Z lock: the shield's raise holds it): pressed with that hand
         // behind the head it takes the item out, and held while the grip stays held (reach back, draw forward, let go);
         // with an item out either grip uses it. Which item is out: vr_game.c's (vk_xr_hand_item)
@@ -1507,7 +1567,7 @@ struct Controls {
                 const float dx = poses[shield].p[0] - head[0], dz = poses[shield].p[2] - head[2];
                 const bool near = dx * dx + dz * dz < shield_reach * shield_reach;
                 keep = shielding ? ahead > std::cos(shield_off) && off_eye < 0.19f && near
-                                 : ahead > std::cos(shield_on) && off_eye < 0.12f && near;
+                                 : ahead > std::cos(shield_on) && off_eye < 0.12f && near && !at_face;
             }
             shielding = keep && !x.ocarina.load();
             if (shielding) set_bit(ZL, true);
@@ -1532,7 +1592,8 @@ struct Controls {
                 const float speed = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
                 // none starts with the hand out to the side of the head or behind it, or moving mostly back toward the
                 // body: pulling the hands back (to draw, to rest) is not a swing
-                const bool back = back_any[sword] > -0.03f || v[0] * fx + v[2] * fz < -0.5f * speed;
+                // nor while both arms shake upward or the hand shakes above the head (the D-pad's gestures)
+                const bool back = back_any[sword] > -0.03f || v[0] * fx + v[2] * fz < -0.5f * speed || both_up || wave[sword];
                 if (!swinging && speed > swing_on && now - swing_at >= refractory_ns && !back) {
                     swinging = swung = true;
                     swing_at = now;

@@ -83,6 +83,8 @@ static const char *const text_en[UI_TEXT_COUNT] = {
         "Menu held: - (secondary menu). "
         "Swinging the sword hand: Y (sword). Both hands together behind your head: draw the sword and shield, or put "
         "them away. Shield facing ahead, held before the eye on its side: Z (target). "
+        "D-pad: both arms shaken upward: down (boots); both hands together before your face: left (ocarina); both "
+        "hands beside your head: right (Navi); a hand shaken sideways above your head: up (mask). "
         "Playing the ocarina: the right stick's left, up, right and down play Y, X, A and R, the A button L.",
     [UI_MENU_VR_HANDEDNESS] = "Handedness", [UI_MENU_VR_HANDEDNESS_RIGHT] = "Right-handed",
     [UI_MENU_VR_HANDEDNESS_LEFT] = "Left-handed",
