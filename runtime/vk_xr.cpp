@@ -187,14 +187,18 @@ struct Xr {
     bool depth_tried = false;
     // VR's hands (NX2NAVI_VR_PLAY=motion, hud_mu): the game's models of the sword and the shield drawn at the hands
     // (shaders/xr_hand_vs.vert, xr_hand_fs.frag) and put into scene8 and the kept depth (xr_hand_mix.comp)
+    // each model read once, by its actor's name: state 1 reading (cpu the model worker's until then), 2 read, 3 none
     struct HandItem {
+        char name[64] = "";
+        std::atomic<int> state{0};
         VrModel cpu{};
-        VkBuffer vb = VK_NULL_HANDLE, ib = VK_NULL_HANDLE, staging = VK_NULL_HANDLE;
-        VkImage tex = VK_NULL_HANDLE;
-        VkImageView tex_view = VK_NULL_HANDLE;
+        VkBuffer vb = VK_NULL_HANDLE, ib = VK_NULL_HANDLE, staging[VR_MODEL_PARTS]{};
+        VkImage tex[VR_MODEL_PARTS]{};
+        VkImageView tex_view[VR_MODEL_PARTS]{};
         bool uploaded = false;
-    } items[2];   // 0 the sword, 1 the shield
-    std::atomic<int> items_state{0};   // 0 not read, 1 reading, 2 read (items[].cpu, the model worker's until then)
+    } items[16];
+    std::mutex gear_mu;
+    char gear[2][64]{};   // vr_game.c vk_xr_gear: the sword and the shield equipped
     VkDescriptorSetLayout hand_set = VK_NULL_HANDLE, mix_set = VK_NULL_HANDLE;
     VkPipelineLayout hand_layout = VK_NULL_HANDLE, mix_layout = VK_NULL_HANDLE;
     VkPipeline hand_pipe = VK_NULL_HANDLE, mix_pipe = VK_NULL_HANDLE;
@@ -785,13 +789,26 @@ void make_aim(VkCommandBuffer cb, const Drawn &d) {
 }
 
 
-// VR's hands: the game's models of the sword and shield (vr_model.c), read once on a worker
-const char *const hand_actors[2] = {"Weapon_Sword_Kokiri", "Weapon_Shield_Deku"};
+// VR's hands: a game model (vr_model.c), read on a worker
+void read_hand_model(void *arg) {
+    Xr::HandItem &it = *(Xr::HandItem *)arg;
+    it.state.store(vr_model_load(it.name, &it.cpu) ? 2 : 3);
+}
 
-void read_hand_models(void *) {
+// The present's thread: the model of this actor, its reading started the first time it is asked for; NULL until read
+Xr::HandItem *hand_item(const char *name) {
     Xr &x = xr();
-    for (int i = 0; i < 2; i++) vr_model_load(hand_actors[i], &x.items[i].cpu);
-    x.items_state.store(2);
+    if (!name[0]) return nullptr;
+    for (auto &it : x.items)
+        if (it.name[0] && !strcmp(it.name, name)) return it.state.load() == 2 ? &it : nullptr;
+    for (auto &it : x.items)
+        if (!it.name[0]) {
+            std::snprintf(it.name, sizeof it.name, "%s", name);
+            it.state.store(1);
+            if (!plat_thread_spawn(read_hand_model, &it, "vr-model", 0)) read_hand_model(&it);
+            return nullptr;
+        }
+    return nullptr;
 }
 
 // A host-visible buffer of n bytes holding `data`
@@ -819,23 +836,26 @@ bool make_host_buffer(VkDeviceSize n, VkBufferUsageFlags usage, const void *data
     return true;
 }
 
-// The model's buffers and texture on the card; the texture's copy recorded into cb
+// The model's buffers and its parts' textures on the card; the textures' copies recorded into cb
 bool upload_item(VkCommandBuffer cb, Xr::HandItem &it) {
     const VrModel &m = it.cpu;
-    if (!m.verts || !m.rgba) return false;
-    const VkDeviceSize tn = (VkDeviceSize)m.tex_w * m.tex_h * 4;
+    if (!m.verts || !m.parts) return false;
     if (!make_host_buffer(sizeof(float) * 8 * m.verts_n, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, m.verts, it.vb) ||
-        !make_host_buffer(sizeof(uint32_t) * m.index_n, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, m.index, it.ib) ||
-        !make_host_buffer(tn, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, m.rgba, it.staging) ||
-        !make_image(m.tex_w, m.tex_h, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                    it.tex, it.tex_view))
+        !make_host_buffer(sizeof(uint32_t) * m.index_n, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, m.index, it.ib))
         return false;
-    barrier(cb, it.tex, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkBufferImageCopy c{};
-    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    c.imageExtent = {m.tex_w, m.tex_h, 1};
-    vkCmdCopyBufferToImage(cb, it.staging, it.tex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
-    barrier(cb, it.tex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    for (int i = 0; i < m.parts; i++) {
+        const VrModelPart &p = m.part[i];
+        if (!make_host_buffer((VkDeviceSize)p.tex_w * p.tex_h * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, p.rgba, it.staging[i]) ||
+            !make_image(p.tex_w, p.tex_h, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                        it.tex[i], it.tex_view[i]))
+            return false;
+        barrier(cb, it.tex[i], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkBufferImageCopy c{};
+        c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        c.imageExtent = {p.tex_w, p.tex_h, 1};
+        vkCmdCopyBufferToImage(cb, it.staging[i], it.tex[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+        barrier(cb, it.tex[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
     it.uploaded = true;
     return true;
 }
@@ -960,14 +980,14 @@ Mat4 inverse_rigid(const Mat4 &a) {
 }
 // The model held in the grip (OpenXR's grip, held pointing forward: -z forward through the fist from the little finger
 // to the thumb, x to the right, y up, on either hand): its axes and where its origin sits, in the grip
-Mat4 held(int item, int right_hand) {
+Mat4 held(int item, int right_hand, const VrModel &m) {
     Mat4 r{};
     r.m[15] = 1;
-    if (item == 0) {   // the sword: the blade (+z) along the fist, its flat (y) across the palm, the grip's middle held
+    if (item == 0) {   // the sword: the blade (+z) along the fist, its flat (y) across the palm, the grip held
         r.m[1] = 1;                 // model x -> grip y
         r.m[4] = 1;                 // model y -> grip x
         r.m[10] = -1;               // model z -> grip -z
-        r.m[14] = -0.20f;           // its grip (model z -0.2) at the hand
+        r.m[14] = m.grip_z;         // its grip (behind the crossguard, vr_model.c) at the hand
     } else {   // the shield: its straps (x) down the grip, its face (+y) out from the back of the hand (the grip's left on
                // the left hand, its right on the right), so the forearm brought across the body guards with it
         const float s = right_hand ? 1.0f : -1.0f;
@@ -984,20 +1004,20 @@ Mat4 held(int item, int right_hand) {
     return r;
 }
 
-// (vk_xr_capture, hud_mu held, after make_panel, before make_eyes) the sword and shield drawn at the hands while Link
-// holds them out, with Play style Motion and the Touch controllers
+// (vk_xr_capture, hud_mu held, after make_panel, before make_eyes) the sword and shield equipped drawn at the hands while
+// Link holds them out, with Play style Motion and the Touch controllers
 void make_hands(VkCommandBuffer cb, const Drawn &d) {
     Xr &x = xr();
     float planes[2];
     if (!d.tracked || strcmp(cfg_value("NX2NAVI_VR_PLAY"), "motion") || strcmp(cfg_value("NX2NAVI_VR_CONTROLS"), "meta") ||
         !x.weapon_out.load() || !x.depth_kept || !vk_dlaa_vr_planes(planes))
         return;
-    int state = 0;
-    if (x.items_state.compare_exchange_strong(state, 1)) {
-        if (!plat_thread_spawn(read_hand_models, nullptr, "vr-models", 0)) read_hand_models(nullptr);
-        return;
+    Xr::HandItem *gear[2];
+    {
+        std::lock_guard<std::mutex> lk(x.gear_mu);
+        gear[0] = hand_item(x.gear[0]), gear[1] = hand_item(x.gear[1]);
     }
-    if (state != 2) return;
+    if (!gear[0] && !gear[1]) return;
     if (!x.hand_tried) {
         x.hand_tried = true;
         if (!make_hand_pipelines()) {
@@ -1026,8 +1046,8 @@ void make_hands(VkCommandBuffer cb, const Drawn &d) {
         }
         x.hand_w = hw, x.hand_h = hh;
     }
-    for (auto &it : x.items)
-        if (!it.uploaded && it.cpu.verts && !upload_item(cb, it)) it.cpu.verts = nullptr;   // (not again)
+    for (auto *it : gear)
+        if (it && !it->uploaded && it->cpu.verts && !upload_item(cb, *it)) it->cpu.verts = nullptr;   // (not again)
     const int sword = strcmp(cfg_value("NX2NAVI_VR_HANDEDNESS"), "right") == 0 ? 1 : 0;
     // the head's view (the picture's pose) and its lens: clip = (x / tan_x, -y / tan_y, near, -z), the depth reversed
     const Mat4 view = inverse_rigid(pose_matrix(d.pose));
@@ -1056,23 +1076,29 @@ void make_hands(VkCommandBuffer cb, const Drawn &d) {
     const VkRect2D sc{{0, 0}, {x.hand_w, x.hand_h}};
     vkCmdSetViewport(cb, 0, 1, &vp), vkCmdSetScissor(cb, 0, 1, &sc);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, x.hand_pipe);
+    // a sword held in both hands (the Biggoron Sword) leaves no shield out
+    const bool two_handed = gear[0] && strstr(gear[0]->name, "Biggoron") != nullptr;
     for (int i = 0; i < 2; i++) {
-        const Xr::HandItem &it = x.items[i];
+        if (!gear[i] || (i == 1 && two_handed)) continue;
+        const Xr::HandItem &it = *gear[i];
         const int hand = i == 0 ? sword : 1 - sword;
         if (!it.uploaded || !ok[hand]) continue;
-        const Mat4 mv = mul(view, mul(pose_matrix(grips[hand]), held(i, hand == 1)));
+        const Mat4 mv = mul(view, mul(pose_matrix(grips[hand]), held(i, hand == 1, it.cpu)));
         const Mat4 clip = mul(proj, mv);
         float pc[32];
         std::memcpy(pc, clip.m, sizeof clip.m), std::memcpy(pc + 16, mv.m, sizeof mv.m);
         vkCmdPushConstants(cb, x.hand_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof pc, pc);
-        const VkDescriptorImageInfo ti{x.hand_sampler, it.tex_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        w.dstBinding = 0, w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, w.pImageInfo = &ti;
-        x.push_set(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, x.hand_layout, 0, 1, &w);
         const VkDeviceSize zero = 0;
         vkCmdBindVertexBuffers(cb, 0, 1, &it.vb, &zero);
         vkCmdBindIndexBuffer(cb, it.ib, 0, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(cb, it.cpu.index_n, 1, 0, 0, 0);
+        for (int k = 0; k < it.cpu.parts; k++) {   // each part with its own texture
+            const VkDescriptorImageInfo ti{x.hand_sampler, it.tex_view[k], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstBinding = 0, w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w.pImageInfo = &ti;
+            x.push_set(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, x.hand_layout, 0, 1, &w);
+            vkCmdDrawIndexed(cb, it.cpu.part[k].count, 1, it.cpu.part[k].first, 0, 0);
+        }
     }
     vkCmdEndRendering(cb);
     barrier(cb, x.hand_color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
@@ -2089,6 +2115,13 @@ extern "C" void vk_xr_wheel_allow(int allow) { xr().wheel_allowed.store(allow !=
 extern "C" void vk_xr_ocarina(int on) { xr().ocarina.store(on != 0); }
 
 extern "C" void vk_xr_weapon_out(int out) { xr().weapon_out.store(out != 0); }
+
+extern "C" void vk_xr_gear(const char *sword, const char *shield) {
+    Xr &x = xr();
+    std::lock_guard<std::mutex> lk(x.gear_mu);
+    std::snprintf(x.gear[0], sizeof x.gear[0], "%s", sword);
+    std::snprintf(x.gear[1], sizeof x.gear[1], "%s", shield);
+}
 
 extern "C" void vk_xr_aim(int on, const double origin[3], const double dir[3]) {
     Xr &x = xr();

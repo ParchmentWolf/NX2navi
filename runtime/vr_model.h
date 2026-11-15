@@ -1,4 +1,4 @@
-// A model of the game's files for VR's hands (vr_model.c): an actor's mesh and its colour texture, read from the
+// A model of the game's files for VR's hands (vr_model.c): an actor's mesh and its colour textures, read from the
 // user's RomFS. Nothing is shipped.
 #pragma once
 #include <stdint.h>
@@ -7,17 +7,29 @@
 extern "C" {
 #endif
 
-// The mesh's vertices by 8 floats (position xyz in metres, normal xyz, texture uv), its triangles' indices, and the
-// colour texture (RGBA8, sRGB-encoded), all malloc'd
+enum { VR_MODEL_PARTS = 8 };
+
+// A part of the mesh drawn with one material: its triangles' indices (first, count) and its colour texture (RGBA8,
+// sRGB-encoded, malloc'd; a 1x1 flat colour where the material has none)
+typedef struct {
+    uint32_t first, count;
+    uint8_t *rgba;
+    uint32_t tex_w, tex_h;
+} VrModelPart;
+
+// The mesh's vertices by 8 floats (position xyz in metres, normal xyz, texture uv) and its triangles' indices,
+// malloc'd, its parts by material and the vertices' bounds
 typedef struct {
     float *verts;
     uint32_t *index;
     uint32_t verts_n, index_n;
-    uint8_t *rgba;
-    uint32_t tex_w, tex_h;
+    VrModelPart part[VR_MODEL_PARTS];
+    int parts;
+    float lo[3], hi[3];
+    float grip_z;   // a sword's (blade along +z): where the hand holds it, 5 cm behind the crossguard (further on a long handle)
 } VrModel;
 
-// Model/<actor>.<actor>.bfres.zs's shapes at their finest detail and the texture its "_Alb" names; 1 when read
+// Model/<actor>.<actor>.bfres.zs's shapes at their finest detail and their materials' "_Alb" textures; 1 when read
 int vr_model_load(const char *actor, VrModel *out);
 void vr_model_free(VrModel *m);
 

@@ -551,6 +551,7 @@ int dbg_texts(void (*cb)(uint32_t hash, const char *text, void *ctx), void *ctx)
     return n;
 }
 uint32_t dbg_name_hash(const char *name) { return hash_of(name); }
+int dbg_text_get(const char *name, char out[64]) { return dbg_supported() && text_get(name, out); }
 
 // An int (kind 2, entries of 0x28 bytes) or an enum (kind 6, 0x38 bytes, the value's name's hash) of the game data, its
 // value now at +0x1c. 0 when the game has no such entry.

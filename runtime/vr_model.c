@@ -5,9 +5,11 @@
 // them (+0x68, +0x6a). A vertex set (FVTX, 0x60 bytes) points at its attributes (+0x08: 0x10 each, the name's string,
 // the format, the offset in the vertex) and strides (+0x38), keeps its data's offset in the buffer section (+0x48), its
 // attribute count (+0x4c) and its vertex count (+0x50). A shape (FSHP, 0x60 bytes) names its vertex set (+0x10) and
-// meshes (+0x18), its levels of detail, the finest first: a mesh (0x38 bytes) has its indices' offset in the buffer
-// section (+0x20), primitive (+0x24, 3 triangles), index size (+0x28, 1 16 bits, 2 32 bits), count (+0x2c) and first
-// vertex (+0x30). Strings are a 16-bit length and the bytes. Textures are apart, Tex/<name>.bntx.zs.
+// meshes (+0x18), its levels of detail, the finest first, and its material's index (+0x52): a mesh (0x38 bytes) has its
+// indices' offset in the buffer section (+0x20), primitive (+0x24, 3 triangles), index size (+0x28, 1 16 bits, 2 32
+// bits), count (+0x2c) and first vertex (+0x30). The model's materials (FMAT, 0xb0 bytes, from +0x38) name their
+// textures (+0x20, strings' offsets; +0xa2 their count). Strings are a 16-bit length and the bytes. Textures are
+// apart, Tex/<name>.bntx.zs, the name whole (a variant's ".00" kept).
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,24 +60,55 @@ static int attr(const uint8_t *p, uint32_t fmt, float out[3]) {
     }
 }
 
-// the first string of the file ending "_Alb" (a material's colour texture), into name
-static int albedo_name(const uint8_t *b, size_t n, char *name, size_t cap) {
-    for (size_t i = 0; i + 6 < n; i++) {
-        const uint16_t len = le16(b + i);
-        if (len < 5 || len >= cap || i + 2 + len >= n || b[i + 2 + len] != 0) continue;
-        const uint8_t *s = b + i + 2;
-        if (memcmp(s + len - 4, "_Alb", 4)) continue;
-        int ok = 1;
-        for (uint16_t k = 0; k < len && ok; k++) ok = s[k] > 32 && s[k] < 127;
-        if (!ok) continue;
-        memcpy(name, s, len), name[len] = 0;
-        return 1;
+// the material's colour texture's name (its texture ending "_Alb", or "_Alb.NN", a variant) into name; 0 when none
+static int albedo_of(const uint8_t *b, size_t n, uint64_t mat, char *name, size_t cap) {
+    if (mat + 0xb0 > n || memcmp(b + mat, "FMAT", 4)) return 0;
+    const uint64_t list = le64(b + mat + 0x20);
+    const uint8_t count = b[mat + 0xa2];
+    for (uint8_t i = 0; i < count && list + 8ull * (i + 1) <= n; i++) {
+        const uint64_t so = le64(b + list + 8ull * i);
+        if (so + 2 > n) continue;
+        uint16_t len = le16(b + so);
+        if (!len || so + 2 + len > n || len >= cap) continue;
+        memcpy(name, b + so + 2, len), name[len] = 0;
+        const char *dot = strchr(name, '.');
+        const size_t stem = dot ? (size_t)(dot - name) : len;
+        if (stem > 4 && !memcmp(name + stem - 4, "_Alb", 4)) return 1;
     }
     return 0;
 }
 
+// a part's texture: its material's colour texture, else a flat colour by the material's name (the game colours such
+// parts in its shaders: a wrap of cloth or leather dark blue, other bare metal a violet-grey, the rest a light grey)
+static void part_texture(const uint8_t *b, size_t n, uint64_t mat, const char *actor, VrModelPart *p) {
+    char tex[96];
+    if (albedo_of(b, n, mat, tex, sizeof tex)) {
+        char tpath[160];
+        snprintf(tpath, sizeof tpath, "Tex/%s.bntx.zs", tex);
+        size_t tn = 0;
+        uint8_t *t = menu_asset_load(tpath, &tn);
+        if (!t || !menu_asset_texture(t, tn, tex, &p->rgba, &p->tex_w, &p->tex_h))
+            rt_log("vr: hands: %s's texture %s not read", actor, tpath);
+        free(t);
+        if (p->rgba) return;
+    }
+    uint8_t c[4] = {170, 170, 170, 255};
+    if (mat + 0x10 <= n) {
+        const uint64_t no = le64(b + mat + 8);
+        const char *nm = no + 2 < n ? (const char *)b + no + 2 : "";
+        const uint16_t len = no + 2 < n ? le16(b + no) : 0;
+        char name[96] = "";
+        if (len < sizeof name && no + 2 + len <= n) memcpy(name, nm, len), name[len] = 0;
+        if (strstr(name, "Coat") || strstr(name, "Cloth") || strstr(name, "Leather")) c[0] = 48, c[1] = 52, c[2] = 110;
+        else if (strstr(name, "Metal") || strstr(name, "Sword")) c[0] = 105, c[1] = 95, c[2] = 150;
+    }
+    p->rgba = malloc(4), p->tex_w = p->tex_h = 1;
+    if (p->rgba) memcpy(p->rgba, c, 4);
+}
+
 void vr_model_free(VrModel *m) {
-    free(m->verts), free(m->index), free(m->rgba);
+    free(m->verts), free(m->index);
+    for (int i = 0; i < m->parts; i++) free(m->part[i].rgba);
     memset(m, 0, sizeof *m);
 }
 
@@ -94,8 +127,8 @@ int vr_model_load(const char *actor, VrModel *out) {
     int ok = 0;
     const uint64_t pool = le64(b + 0xb0), model = le64(b + 0x28);
     if (!IN(pool, 16) || !IN(model, 0x70) || memcmp(b + model, "FMDL", 4)) goto done;
-    const uint64_t buffers = le64(b + pool + 8), shapes = le64(b + model + 0x28);
-    const uint16_t shape_n = le16(b + model + 0x6a);
+    const uint64_t buffers = le64(b + pool + 8), shapes = le64(b + model + 0x28), mats = le64(b + model + 0x38);
+    const uint16_t shape_n = le16(b + model + 0x6a), mat_n = le16(b + model + 0x6c);
     // two passes over the shapes: their sizes, then their data
     for (int pass = 0; pass < 2; pass++) {
         uint32_t nv = 0, ni = 0;
@@ -139,6 +172,12 @@ int vr_model_load(const char *actor, VrModel *out) {
                     const uint32_t k = isize == 4 ? le32(b + ib + 4ull * i) : le16(b + ib + 2ull * i);
                     out->index[ni + i] = nv + first + k < nv + count ? nv + first + k : nv;
                 }
+                if (out->parts < VR_MODEL_PARTS) {
+                    VrModelPart *p = &out->part[out->parts++];
+                    const uint16_t mi = le16(b + s + 0x52);
+                    p->first = ni, p->count = icount - icount % 3;
+                    part_texture(b, n, mi < mat_n ? mats + 0xb0ull * mi : n, actor, p);
+                }
             }
             nv += count, ni += icount - icount % 3;
         }
@@ -148,24 +187,38 @@ int vr_model_load(const char *actor, VrModel *out) {
             if (!out->verts || !out->index) goto done;
         } else {
             out->verts_n = nv, out->index_n = ni;
+            for (int c = 0; c < 3; c++) out->lo[c] = 1e9f, out->hi[c] = -1e9f;
+            for (uint32_t v = 0; v < nv; v++)
+                for (int c = 0; c < 3; c++)
+                    out->lo[c] = fminf(out->lo[c], out->verts[8 * v + c]), out->hi[c] = fmaxf(out->hi[c], out->verts[8 * v + c]);
+            // the crossguard: along z in 64 slices, from the pommel, the first slice past the grip's own that is more
+            // than 2.5 times as wide (across x) as the grip's widest (slices 4 to 8)
+            enum { SLICES = 64 };
+            float w[SLICES] = {0};
+            const float span = out->hi[2] - out->lo[2];
+            out->grip_z = out->lo[2] + 0.11f;
+            if (span > 0.05f) {
+                for (uint32_t v = 0; v < nv; v++) {
+                    int i = (int)((out->verts[8 * v + 2] - out->lo[2]) / span * SLICES);
+                    i = i < 0 ? 0 : i >= SLICES ? SLICES - 1 : i;
+                    w[i] = fmaxf(w[i], fabsf(out->verts[8 * v]));
+                }
+                float grip = 0;
+                for (int i = 4; i <= 8; i++) grip = fmaxf(grip, w[i]);
+                for (int i = 9; i < SLICES / 2; i++)
+                    if (grip > 0 && w[i] > 2.5f * grip) {
+                        const float guard = out->lo[2] + span * i / SLICES, handle = guard - out->lo[2];
+                        out->grip_z = guard - 0.05f;
+                        // a long handle (a sword for both hands): halfway on toward the handle's middle
+                        if (handle > 0.30f) out->grip_z = 0.5f * (out->grip_z + (out->lo[2] + 0.5f * handle));
+                        break;
+                    }
+            }
         }
     }
-    char tex[96];
-    if (albedo_name(b, n, tex, sizeof tex)) {
-        char tpath[160];
-        snprintf(tpath, sizeof tpath, "Tex/%s.bntx.zs", tex);
-        size_t tn = 0;
-        uint8_t *t = menu_asset_load(tpath, &tn);
-        if (!t || !menu_asset_texture(t, tn, tex, &out->rgba, &out->tex_w, &out->tex_h))
-            rt_log("vr: hands: %s's texture %s not read", actor, tpath);
-        free(t);
-    }
-    if (!out->rgba) {   // a plain grey then
-        out->rgba = malloc(4), out->tex_w = out->tex_h = 1;
-        if (out->rgba) memset(out->rgba, 160, 4);
-    }
-    ok = out->rgba != NULL;
-    if (ok) rt_log("vr: hands: %s: %u vertices, %u triangles, texture %ux%u", actor, out->verts_n, out->index_n / 3, out->tex_w, out->tex_h);
+    ok = out->parts > 0;
+    for (int i = 0; i < out->parts; i++) ok = ok && out->part[i].rgba;
+    if (ok) rt_log("vr: hands: %s: %u vertices, %u triangles, %d parts", actor, out->verts_n, out->index_n / 3, out->parts);
 done:
 #undef IN
     free(b);

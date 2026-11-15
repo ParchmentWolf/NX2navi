@@ -22,6 +22,7 @@ int dbg_player_rot(float m[9]);        // Link's rotation, a 3x3 matrix by rows;
 int dbg_area(char out[64]);            // the area the game is in, by its name in the game's files; 0 unknown
 // Every 64-character text of the game data (the area among them) with the hash of its name; returns their number.
 int dbg_texts(void (*cb)(uint32_t hash, const char *text, void *ctx), void *ctx);
+int dbg_text_get(const char *name, char out[64]);   // a 64-character text of the game data by name; 0 none
 uint32_t dbg_name_hash(const char *name);   // the hash the game knows a flag or a text by
 int dbg_flag_get(const char *name, int *on);   // an on/off flag of the game data now; 0 when there is no such flag
 uint64_t dbg_player_actor(void);       // Link's actor; 0 while there is no player

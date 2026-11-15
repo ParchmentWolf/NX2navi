@@ -148,6 +148,12 @@ void vr_tick(Cpu *c) {
     char weapon[48];   // his upper body with a weapon out: "CommonUpper" ("" once put away)
     link_state_at(weapon, 0x31c);
     vk_xr_weapon_out(weapon[0] && strcmp(weapon, "WeaponEquipOffUpper"));
+    {   // the sword and shield equipped (actor names), for VR's hands
+        char sword[64], shield[64];
+        if (!dbg_text_get("PlayerStatus.EquipWeapon", sword)) sword[0] = 0;
+        if (!dbg_text_get("PlayerStatus.EquipShield", shield)) shield[0] = 0;
+        vk_xr_gear(sword, shield);
+    }
     int slot;
     const int open = vk_xr_wheel(&slot) != 0;
     int p = 0, pre = 0, post = 0;

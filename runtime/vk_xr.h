@@ -57,6 +57,8 @@ void vk_xr_ocarina(int on);
 // vr_game.c, the game's thread: Link holds his sword and shield (or another weapon) out now, so the draw gesture puts
 // them away
 void vk_xr_weapon_out(int out);
+// vr_game.c, the game's thread: the sword and shield equipped, by their actors' names ("" none)
+void vk_xr_gear(const char *sword, const char *shield);
 // vr_game.c, the gameplay camera's update before vk_xr_camera: Link aims (on) along the game's own camera's ray
 // (origin, unit direction; game units): the head's view draws the reticle where it lands
 void vk_xr_aim(int on, const double origin[3], const double dir[3]);
