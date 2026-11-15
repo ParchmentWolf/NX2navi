@@ -2215,13 +2215,20 @@ static void count_draw(ImDrawList *dl, int n, int max, ImVec2 c, float size, boo
                                               : IM_COL32(255, 255, 255, 255);
     dl->AddText(font, size, at, col, text);
 }
-// a slot's icon centred on p, size wide, and its small icons along its bottom (the one in use framed) with their counts
-// (the slot's own count is drawn toward the wheel's middle, wheel_draw)
+// a small icon centred on p, m wide, its count at its bottom right
+static void mini_draw(ImDrawList *dl, const VrIcon &ic, int count, int max, ImVec2 p, float m) {
+    ImTextureID tex;
+    const ImVec2 a(p.x - m * 0.5f, p.y - m * 0.5f), b(p.x + m * 0.5f, p.y + m * 0.5f);
+    if (icon_tex(ic, &tex)) dl->AddImage(tex, a, b);
+    count_draw(dl, count, max, b, m * 0.36f, true);
+}
+// a slot's icon centred on p, size wide, and the adult's arrows in a row along its bottom (the one in use framed); the
+// slot's own count and the swaps' small icons are drawn around it by wheel_draw
 static void slot_draw(ImDrawList *dl, const VrSlot &s, ImVec2 p, float size) {
     ImTextureID tex;
     const float h = size * 0.5f;
     if (icon_tex(s.main, &tex)) dl->AddImage(tex, ImVec2(p.x - h, p.y - h), ImVec2(p.x + h, p.y + h));
-    if (!s.minis) return;
+    if (!s.minis || s.mini_selected < 0) return;
     const float m = size * (s.mini_selected >= 0 ? 0.3f : 0.42f), gap = m * 0.08f;
     const float row = s.minis * m + (s.minis - 1) * gap;
     float x = p.x - row * 0.5f;
@@ -2253,9 +2260,15 @@ static void wheel_draw(const MenuTarget *t, float scale, int kind, int picked) {
                 dl->AddQuadFilled(at(b0, r), at(b0, R - 2), at(b1, R - 2), at(b1, r), IM_COL32(150, 112, 50, 235));
             }
         dl->AddLine(at(a0, r), at(a0, R), SKIN_GOLD, 2.0f);
-        if (vr_wheel_slot(kind, i, &s)) {   // its count between the icon and the inner ring
+        if (vr_wheel_slot(kind, i, &s)) {   // its count between the icon and the inner ring, its swaps by the outer one
             slot_draw(dl, s, at(i * step, mid), icon);
             count_draw(dl, s.count, s.max, at(i * step, 0.5f * (r + mid - icon * 0.5f)), icon * 0.28f, false);
+            if (s.minis && s.mini_selected < 0) {
+                const float m = icon * 0.42f, out = 0.5f * (mid + icon * 0.5f + R), spread = m * 1.1f / out;
+                for (int k = 0; k < s.minis; k++)
+                    mini_draw(dl, s.mini[k], s.mini_count[k], s.mini_max[k],
+                              at(i * step + (k - 0.5f * (s.minis - 1)) * spread, out), m);
+            }
         }
     }
     dl->AddCircle(c, R - 1, SKIN_GOLD, 96, 3.0f);
