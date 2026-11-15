@@ -30,6 +30,9 @@ int vk_dlaa_fg_inputs(VkFfxImage *depth, VkFfxImage *mv, float *jx, float *jy, i
 // fg_only_frame): the motion passes run as for the upscaler (vk_usnap.c, vk_exec_draw.c, vk_mvprev.c), nothing is
 // jittered. Read at each present.
 int vk_dlaa_fg_only(void);
+// ... and something takes motion from it: frame generation does, VR's depth stereo alone does not (vk_mvprev.c,
+// vk_exec_draw.c's per-object motion skip their work then)
+int vk_dlaa_fg_motion(void);
 // ... their views, and this frame's camera for DLSS Frame Generation (vk_dlssg.c): matrices for row vectors (v * M, the
 // rows stored in order), as Streamline takes them; 0 without a camera that frame.
 // znear and zfar: the view distances the depth buffer holds as 0 and 1 (1 and 0 when inverted), from the frame's own
