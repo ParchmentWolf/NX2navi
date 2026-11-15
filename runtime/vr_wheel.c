@@ -19,28 +19,29 @@ typedef struct {
     const char *name;    // its item's name: IsGet.<name>, PouchData.<name>.StockNum, the icon <name>
     Own own;             // OWN_ARROW: IsGet.<name> and the bow
     const char *label;   // shown under the wheel
+    const char *ammo;    // what counts it (PouchData.<ammo>.StockNum), NULL none
 } Item;
 
 static const Item kItems[] = {
-    {"SlingShot", "Weapon_Range_SlingShot", OWN_GET, "Fairy Slingshot"},
-    {"Bow", "Weapon_Range_Bow", OWN_GET, "Fairy Bow"},
-    {"FireArrow", "Item_Arrow_Fire", OWN_ARROW, "Fire Arrow"},
-    {"IceArrow", "Item_Arrow_Ice", OWN_ARROW, "Ice Arrow"},
-    {"LightArrow", "Item_Arrow_Light", OWN_ARROW, "Light Arrow"},
+    {"SlingShot", "Weapon_Range_SlingShot", OWN_GET, "Fairy Slingshot", "Item_DekuSeed"},
+    {"Bow", "Weapon_Range_Bow", OWN_GET, "Fairy Bow", "Item_Arrow_Normal"},
+    {"FireArrow", "Item_Arrow_Fire", OWN_ARROW, "Fire Arrow", "Item_Arrow_Normal"},
+    {"IceArrow", "Item_Arrow_Ice", OWN_ARROW, "Ice Arrow", "Item_Arrow_Normal"},
+    {"LightArrow", "Item_Arrow_Light", OWN_ARROW, "Light Arrow", "Item_Arrow_Normal"},
     {"Boomerang", "Item_Boomerang", OWN_GET, "Boomerang"},
     {"Hookshot", "Item_Hookshot", OWN_GET, "Hookshot"},
     {"Longshot", "Item_Longshot", OWN_GET, "Longshot"},
-    {"DekuStick", "Item_DekuStick", OWN_GET, "Deku Stick"},
+    {"DekuStick", "Item_DekuStick", OWN_GET, "Deku Stick", "Item_DekuStick"},
     {"Hammer", "Item_Hammer", OWN_GET, "Megaton Hammer"},
-    {"DekuNut", "Item_DekuNut", OWN_GET, "Deku Nut"},
-    {"Bomb", "Item_Bomb", OWN_GET, "Bombs"},
-    {"Bombchu", "Item_Bombchu", OWN_GET, "Bombchus"},
+    {"DekuNut", "Item_DekuNut", OWN_GET, "Deku Nut", "Item_DekuNut"},
+    {"Bomb", "Item_Bomb", OWN_GET, "Bombs", "Item_Bomb"},
+    {"Bombchu", "Item_Bombchu", OWN_GET, "Bombchus", "Item_Bombchu"},
     {"GlassTruth", "Armor_GlassTruth", OWN_GET, "Lens of Truth"},
     {"DinFire", "Item_DinFire", OWN_GET, "Din's Fire"},
     {"FaroreWind", "Item_FaroreWind", OWN_GET, "Farore's Wind"},
     {"NayruLove", "Item_NayruLove", OWN_GET, "Nayru's Love"},
-    {"MagicBean", "Item_MagicBean", OWN_GET, "Magic Beans"},
-    {"ScrubBusinessSeed", "Item_ScrubBusinessSeed", OWN_STOCK, "Deku Seed"},
+    {"MagicBean", "Item_MagicBean", OWN_GET, "Magic Beans", "Item_MagicBean"},
+    {"ScrubBusinessSeed", "Item_ScrubBusinessSeed", OWN_STOCK, "Deku Seed", "Item_ScrubBusinessSeed"},
     {"BottleA", "A", OWN_BOTTLE, NULL}, {"BottleB", "B", OWN_BOTTLE, NULL}, {"BottleC", "C", OWN_BOTTLE, NULL},
     {"BottleD", "D", OWN_BOTTLE, NULL}, {"BottleE", "E", OWN_BOTTLE, NULL},
     {"WeirdEgg", "Item_WeirdEgg", OWN_STOCK, "Weird Egg"},
@@ -175,6 +176,42 @@ static const char *variant(const Var *v, const char **icon, const char **label) 
     return NULL;
 }
 
+// How many of a counted item can be carried: the largest of its bags owned (the game's RSDB/PouchActorInfo,
+// AfterExpansionMaxNum of each bag, the bags the item's MaxNumGameData shares; the smallest without one), or its
+// FixedMaxNum; -1 unknown
+static int max_of(const char *ammo) {
+    static const struct { const char *ammo, *bag; int n[3]; } bags[] = {
+        {"Item_Bomb", "BombBag", {20, 30, 40}},        {"Item_Bombchu", "BombBag", {20, 30, 40}},
+        {"Item_Arrow_Normal", "Quiver", {30, 40, 50}}, {"Item_DekuSeed", "BulletBag", {30, 40, 50}},
+        {"Item_DekuNut", "NutBag", {20, 30, 40}},      {"Item_DekuStick", "StickBag", {10, 20, 30}},
+    };
+    static const char *const sizes[3] = {"Small", "Medium", "Large"};
+    if (!strcmp(ammo, "Item_MagicBean")) return 10;
+    for (size_t i = 0; i < sizeof bags / sizeof *bags; i++) {
+        if (strcmp(bags[i].ammo, ammo)) continue;
+        char key[128];
+        for (int s = 2; s > 0; s--) {
+            snprintf(key, sizeof key, "IsGet.Item_%s_%s", bags[i].bag, sizes[s]);
+            if (flag(key)) return bags[i].n[s];
+        }
+        return bags[i].n[0];
+    }
+    return -1;
+}
+
+// A value's ammunition or stock now (-1 for an item that has none) and *max how many can be carried
+static int count_of(const char *value, int *max) {
+    const Item *it = value ? item_of(value) : NULL;
+    char key[128];
+    int32_t n = 0;
+    *max = -1;
+    if (!it || !it->ammo) return -1;
+    snprintf(key, sizeof key, "PouchData.%s.StockNum", it->ammo);
+    if (!dbg_int_get(key, &n)) return -1;
+    *max = max_of(it->ammo);
+    return n;
+}
+
 // The item slot now: its variants owned (their indices in the list, *n of them) and the one in use (an index of those)
 static const Var *slot_vars(int slot, int *count) {
     const Var *vars = vr_wheel_child() ? kSlots[slot].child : kSlots[slot].adult;
@@ -236,7 +273,8 @@ static int dpad_slot(int slot, VrSlot *out) {
 
 int vr_wheel_slot(int kind, int slot, VrSlot *out) {
     memset(out, 0, sizeof *out);
-    out->mini_selected = -1;
+    out->mini_selected = -1, out->count = out->max = -1;
+    for (int i = 0; i < 4; i++) out->mini_count[i] = out->mini_max[i] = -1;
     if (kind == VR_WHEEL_DPAD) return dpad_slot(slot, out);
     if (slot < 0 || slot >= VR_WHEEL_ITEM_SLOTS) return 0;
     int count, owned_idx[4], n_owned;
@@ -244,8 +282,9 @@ int vr_wheel_slot(int kind, int slot, VrSlot *out) {
     const int cur = slot_current(slot, vars, count, owned_idx, &n_owned);
     if (cur < 0) return 0;
     const char *icon, *label;
-    variant(&vars[owned_idx[cur]], &icon, &label);
+    const char *value = variant(&vars[owned_idx[cur]], &icon, &label);
     out->label = label;
+    out->count = count_of(value, &out->max);   // (the arrows share one count, the bow's)
     icon_file(&out->now, owned_idx[cur] == 0 || !kSlots[slot].arrows ? icon : kArrowIcon[owned_idx[cur] & 3]);
     if (kSlots[slot].arrows && !vr_wheel_child()) {   // the bow, its arrows under it, the one in use framed
         icon_file(&out->main, "Weapon_Range_Bow");
@@ -257,8 +296,13 @@ int vr_wheel_slot(int kind, int slot, VrSlot *out) {
         return 1;
     }
     icon_file(&out->main, icon);
-    for (int k = 0; k < n_owned && out->minis < 3; k++)   // the others a tap swaps to
-        if (k != cur && variant(&vars[owned_idx[k]], &icon, &label)) icon_file(&out->mini[out->minis++], icon);
+    for (int k = 0; k < n_owned && out->minis < 3; k++) {   // the others a tap swaps to
+        const char *other = k != cur ? variant(&vars[owned_idx[k]], &icon, &label) : NULL;
+        if (other) {
+            out->mini_count[out->minis] = count_of(other, &out->mini_max[out->minis]);
+            icon_file(&out->mini[out->minis++], icon);
+        }
+    }
     return 1;
 }
 

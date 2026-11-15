@@ -14,12 +14,15 @@ typedef struct {
 } VrIcon;
 
 // What a slot shows: its icon and name, and small icons under it: the variants a tap swaps to, or the adult's arrows
-// (then mini_selected frames the one in use; -1 none)
+// (then mini_selected frames the one in use; -1 none). Counts: the ammunition or stock left, -1 for an item without;
+// maxes: how many can be carried now, -1 unknown
 typedef struct {
     VrIcon main;
     VrIcon now;            // what is equipped from it: the variant in use (an arrow's own icon where main is the bow)
     const char *label;
+    int count, max;
     VrIcon mini[4];
+    int mini_count[4], mini_max[4];
     int minis, mini_selected;
 } VrSlot;
 

@@ -2195,7 +2195,28 @@ static bool icon_tex(const VrIcon &ic, ImTextureID *tex) {
     if (!strcmp(ic.tex, "HUDNaviIcon_Body_00")) return menu_art(MENU_ART_NAVI_ICON, tex, nullptr, nullptr) != 0;
     return menu_icon(ic.file, ic.tex, tex) != 0;
 }
-// a slot's icon centred on p, size wide, and its small icons along its bottom (the one in use framed)
+// a count, size high, centred on c or (corner) with its bottom right at c, outlined so it reads over any icon: green
+// full (max known), yellow at a quarter of the max or less, red none, white otherwise
+static void count_draw(ImDrawList *dl, int n, int max, ImVec2 c, float size, bool corner) {
+    if (n < 0) return;
+    char text[16];
+    snprintf(text, sizeof text, "%d", n);
+    ImFont *font = ImGui::GetFont();
+    const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0, text);
+    const ImVec2 at = corner ? ImVec2(c.x - ts.x, c.y - ts.y + size * 0.1f)
+                             : ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f);
+    const float o = size * 0.07f > 1 ? size * 0.07f : 1;
+    for (int dx = -1; dx <= 1; dx++)
+        for (int dy = -1; dy <= 1; dy++)
+            if (dx || dy) dl->AddText(font, size, ImVec2(at.x + dx * o, at.y + dy * o), IM_COL32(0, 0, 0, 230), text);
+    const ImU32 col = n <= 0                  ? IM_COL32(255, 110, 90, 255)
+                      : max > 0 && n >= max   ? IM_COL32(120, 255, 120, 255)
+                      : max > 0 && n * 4 <= max ? IM_COL32(255, 225, 80, 255)
+                                              : IM_COL32(255, 255, 255, 255);
+    dl->AddText(font, size, at, col, text);
+}
+// a slot's icon centred on p, size wide, and its small icons along its bottom (the one in use framed) with their counts
+// (the slot's own count is drawn toward the wheel's middle, wheel_draw)
 static void slot_draw(ImDrawList *dl, const VrSlot &s, ImVec2 p, float size) {
     ImTextureID tex;
     const float h = size * 0.5f;
@@ -2207,6 +2228,7 @@ static void slot_draw(ImDrawList *dl, const VrSlot &s, ImVec2 p, float size) {
     const float y = p.y + h - m * 0.75f;
     for (int i = 0; i < s.minis; i++, x += m + gap) {
         if (icon_tex(s.mini[i], &tex)) dl->AddImage(tex, ImVec2(x, y), ImVec2(x + m, y + m));
+        count_draw(dl, s.mini_count[i], s.mini_max[i], ImVec2(x + m, y + m), m * 0.36f, true);
         if (i == s.mini_selected)
             dl->AddRect(ImVec2(x - 1, y - 1), ImVec2(x + m + 1, y + m + 1), IM_COL32(255, 255, 255, 255), 0, 0, 2.0f);
     }
@@ -2231,7 +2253,10 @@ static void wheel_draw(const MenuTarget *t, float scale, int kind, int picked) {
                 dl->AddQuadFilled(at(b0, r), at(b0, R - 2), at(b1, R - 2), at(b1, r), IM_COL32(150, 112, 50, 235));
             }
         dl->AddLine(at(a0, r), at(a0, R), SKIN_GOLD, 2.0f);
-        if (vr_wheel_slot(kind, i, &s)) slot_draw(dl, s, at(i * step, mid), icon);
+        if (vr_wheel_slot(kind, i, &s)) {   // its count between the icon and the inner ring
+            slot_draw(dl, s, at(i * step, mid), icon);
+            count_draw(dl, s.count, s.max, at(i * step, 0.5f * (r + mid - icon * 0.5f)), icon * 0.28f, false);
+        }
     }
     dl->AddCircle(c, R - 1, SKIN_GOLD, 96, 3.0f);
     dl->AddCircle(c, r, SKIN_GOLD, 64, 2.0f);
@@ -2240,7 +2265,7 @@ static void wheel_draw(const MenuTarget *t, float scale, int kind, int picked) {
     if (picked < 0 || !vr_wheel_slot(kind, picked, &s)) return;
     {   // the middle: only what the release equips
         VrSlot only = {};
-        only.main = s.now;
+        only.main = s.now, only.count = -1;
         slot_draw(dl, only, c, 1.35f * r);
     }
     if (!s.label) return;
