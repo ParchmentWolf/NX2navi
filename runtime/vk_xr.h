@@ -26,6 +26,12 @@ void vk_xr_device_ready(VkInstance instance, VkPhysicalDevice phys, VkDevice dev
 // The head's view (NX2NAVI_VR_VIEW=head): the game's camera follows the headset. vr_game.c switches its camera hooks
 // on when this is 1 at start
 int vk_xr_head_wanted(void);
+// Depth stereo (NX2NAVI_VR_DEPTH above 0 with the head's view): each eye's picture made from the game's one and its
+// depth; vk_dlaa.c makes the scene's depth and planes ready for each present while this is 1
+int vk_xr_depth_wanted(void);
+// vk_dlaa.c, once the scene is drawn and before later passes reuse its depth target: the scene's depth (a sampled
+// view, in GENERAL) copied for this frame's depth stereo; binds a compute pipeline and push descriptors of its own
+void vk_xr_keep_depth(VkCommandBuffer cb, VkImageView depth, uint32_t w, uint32_t h);
 // The head's view is on now (the session running, the menu closed): vr_game.c's first person applies
 int vk_xr_head_active(void);
 // vr_game.c, the gameplay camera's update: 1 when the head's view applies now, the camera's position, target and up

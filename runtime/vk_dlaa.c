@@ -34,6 +34,7 @@
 #include "vk_fg.h"
 #include "vk_ffx.h"
 #include "vk_rec.h"
+#include "vk_xr.h"
 #include "dlaa_mv_spv.h"
 #include "dlaa_sharpen_spv.h"
 
@@ -631,6 +632,16 @@ int vk_dlaa_pose_depth(uint64_t frame, uint32_t w, uint32_t h, VkDescriptorImage
         !frame || last->pose_distance_frame != frame - 1 || fabsf(last->pose_history[2]) < 1e-6f) return 0;
     *image = (VkDescriptorImageInfo){D.mv_samp, last->dist_view[last->dist_cur ^ 1], VK_IMAGE_LAYOUT_GENERAL};
     memcpy(history, last->pose_history, sizeof last->pose_history);
+    return 1;
+}
+
+int vk_dlaa_vr_planes(float planes[2]) {
+    if (!D.fg_cam_ok || D.failed || !fg_current(D.fg_at)) return 0;
+    // d = a + b / distance through the stored 0 and 1 (proj_planes): (n, f) as (0, 1), or as (1, 0) inverted
+    const double n = D.fg_cam.znear, f = D.fg_cam.zfar;
+    if (D.fg_cam.infinite) planes[0] = D.fg_cam.inverted ? 0.0f : 1.0f, planes[1] = (float)(D.fg_cam.inverted ? n : -n);
+    else if (D.fg_cam.inverted) planes[0] = (float)(-n / (f - n)), planes[1] = (float)(n * f / (f - n));
+    else planes[0] = (float)(f / (f - n)), planes[1] = (float)(-n * f / (f - n));
     return 1;
 }
 
@@ -2426,6 +2437,10 @@ evaluated:
     D.jdepth = z->image, D.jw = z->width, D.jh = z->height;
     // for frame generation at this frame's present (vk_dlaa_fg_inputs)
     D.fg_depth = (VkFfxImage){z->image, z->format, w, h, 0};
+    if (vk_xr_depth_wanted()) {   // VR's own copy of the depth: its shader's bindings, so the next draw binds all again
+        vk_xr_keep_depth(cb, zv, w, h);
+        vk_exec_draw_new_cb();
+    }
     D.fg_mv = (VkFfxImage){e->mv, VK_FORMAT_R16G16_SFLOAT, w, h, 1};
     D.fg_depth_view = zv, D.fg_mv_view = e->mv_view;
     D.fg_jx = jx, D.fg_jy = jy, D.fg_at = D.presents, D.fg_fresh = 1;
@@ -3099,7 +3114,9 @@ static void idle_release(void) {
 
 // Frame generation that takes this frame's inputs: NVIDIA's through Streamline (vk_dlssg.c, set up with the device),
 // AMD's swapchain in place (vk_fg.cpp, either library) or NVIDIA's through NGX, set now (vk_ngxfg_on).
-static int fg_runs(void) { return vk_dlssg_active() || vk_fg_active() || vk_ngxfg_on(); }
+// VR's depth stereo (vk_xr_depth_wanted) takes the scene's depth (vk_xr_keep_depth) and its planes (vk_dlaa_vr_planes)
+// from the same frames.
+static int fg_runs(void) { return vk_dlssg_active() || vk_fg_active() || vk_ngxfg_on() || vk_xr_depth_wanted(); }
 
 // One line at the first present and one at each change: whether frame generation runs, and where its inputs come from.
 static void fg_state_line(int on, int fgo) {
@@ -3109,6 +3126,8 @@ static void fg_state_line(int on, int fgo) {
     last = st;
     if (st == 0) rt_log("dlaa: frame generation does not run: no inputs are made for it");
     else if (st == 1) rt_log("dlaa: frame generation runs with its inputs from the upscaler (%s)", use_fsr() ? "FSR" : "DLSS");
+    else if (st == 2 && !(vk_dlssg_active() || vk_fg_active() || vk_ngxfg_on()))
+        rt_log("dlaa: VR's depth stereo takes the scene's depth and camera without an upscaler, no jitter");
     else if (st == 2)
         rt_log("dlaa: frame generation runs without an upscaler: the scene's depth, motion vectors and camera, no "
                "jitter, and the picture without the HUD from the game's own scaling");
@@ -3173,6 +3192,10 @@ static void fg_only_frame(VkExec *ex, const VkExecTarget *dst) {
     vk_exec_draw_new_cb();   // the motion pass bound a pipeline and descriptors of its own: the next draw binds all again
     D.jdepth = z->image, D.jw = z->width, D.jh = z->height;   // the scene depth the camera's draws go to (vk_dlaa_draw)
     D.fg_depth = (VkFfxImage){z->image, z->format, w, h, 0};
+    if (vk_xr_depth_wanted()) {   // VR's own copy of the depth: its shader's bindings, so the next draw binds all again
+        vk_xr_keep_depth(cb, zv, w, h);
+        vk_exec_draw_new_cb();
+    }
     D.fg_mv = (VkFfxImage){e->mv, VK_FORMAT_R16G16_SFLOAT, w, h, 1};
     D.fg_depth_view = zv, D.fg_mv_view = e->mv_view;
     D.fg_jx = D.fg_jy = 0.0f, D.fg_at = D.presents, D.fg_fresh = 1;

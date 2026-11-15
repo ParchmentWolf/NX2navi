@@ -87,6 +87,7 @@ static const char *const known[] = {
     "TEX_COMPACT", "TEX_COMPACT_MIN_MB", "TEX_COMPACT_FRAME_MB",   // texture compaction (vk_texture.c); no menu row
     "STANDIN_FILTER",   // the filter of the scene upscaler's stand-in (vk_tonemap.c); no menu row
     "VR", "VR_SCREEN", "VR_VIEW", "VR_CAMERA", "VR_EYE_UP", "VR_EYE_SIDE", "VR_EYE_FORWARD", "VR_HUD", "VR_HUD_SIZE", "VR_VIEW_SCALE",
+    "VR_DEPTH",
     "PATCH_VR_LENS",   // VR through OpenXR (vk_xr.cpp, vr_game.c)
     // retired: the settings of the co-op of versions up to 0.9.2; read by nothing, listed so that a file which still
     // sets them logs no unknown key
@@ -173,7 +174,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"MEM_BUDGET_TEST_VRAM_MB", "diagnostics"}, {"MEM_BUDGET_TEST_RAM_MB", "diagnostics"},
     {"TEX_COMPACT", "performance"}, {"TEX_COMPACT_MIN_MB", "performance"}, {"TEX_COMPACT_FRAME_MB", "performance"},
     {"VR", "vr"}, {"VR_SCREEN", "vr"}, {"VR_VIEW", "vr"}, {"VR_CAMERA", "vr"}, {"VR_EYE_UP", "vr"}, {"VR_EYE_SIDE", "vr"},
-    {"VR_EYE_FORWARD", "vr"}, {"VR_HUD", "vr"}, {"VR_HUD_SIZE", "vr"}, {"VR_VIEW_SCALE", "vr"},
+    {"VR_EYE_FORWARD", "vr"}, {"VR_HUD", "vr"}, {"VR_HUD_SIZE", "vr"}, {"VR_VIEW_SCALE", "vr"}, {"VR_DEPTH", "vr"},
 };
 
 // The settings the menu shows: the value in effect when the key is unset, and what the key accepts. The only place a
@@ -206,7 +207,9 @@ static const CfgMeta metas[] = {
     // vk_xr.cpp: the HUD on a panel in front of the head (panel) or left in the picture, and the panel's width in cm
     {"VR_HUD", "panel", "panel|picture", LIVE}, {"VR_HUD_SIZE", "100", "40..200", LIVE},
     // vk_xr.cpp: the game's view this many percent of the headset's lens, shown in the lens (more: the world smaller)
-    {"VR_VIEW_SCALE", "130", "50..200", LIVE},
+    {"VR_VIEW_SCALE", "100", "50..200", LIVE},
+    // vk_xr.cpp: depth stereo, each eye this many percent of half the eyes' distance to its side (0: both eyes one picture)
+    {"VR_DEPTH", "100", "0..200", LIVE},
     {"MONITOR", "auto", NULL, RESTART},   // auto|primary|<1-based index>|<part of a monitor name> (gfx_window_win.c, gfx_window_sdl.c chosen_monitor)
     {"PERF_OVERLAY", "off", "off|fps|full", LIVE},
     {"OUTPUT_RES", "1920x1080", NULL, RESTART}, {"RENDER_SCALE", "game", "game|50|67|75|100|125|150|200", RESTART},

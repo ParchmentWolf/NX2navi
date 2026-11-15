@@ -63,11 +63,13 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_VR_HUD_DESC] = "Panel in front of you: the hearts, buttons and map float on a panel that moves with your head, "
         "and the world is shown without them. In the picture: the HUD stays drawn over the world.",
     [UI_MENU_VR_HUD_SIZE] = "HUD size", [UI_MENU_VR_HUD_SIZE_DESC] = "The width of the HUD's panel, a metre in front of you.",
+    [UI_MENU_VR_DEPTH] = "Depth",
+    [UI_MENU_VR_DEPTH_DESC] = "How strongly each eye sees the world from its own side, made from the game's one picture and its "
+                              "depth. 100% matches your eyes' own distance; 0% shows both eyes the same flat picture.",
     [UI_MENU_VR_SCALE] = "Field of view",
-    [UI_MENU_VR_SCALE_DESC] = "How much of the world the view takes in. 100% matches the headset's lenses exactly; the default, "
-        "130%, makes the world feel closer to its size on a screen. Higher fits more of the world into your view, so "
-        "everything looks smaller; lower zooms in. Far from 100%, the world can seem to move "
-        "a little as you turn your head.",
+    [UI_MENU_VR_SCALE_DESC] = "How much of the world the view takes in. The default, 100%, matches the headset's lenses exactly. "
+        "Higher fits more of the world into your view, so everything looks smaller; lower zooms in. Away from 100%, "
+        "the world seems to swim as you turn your head.",
     [UI_MENU_CONTINUE] = "Continue", [UI_MENU_QUIT] = "Quit game",
     [UI_MENU_ON] = "On", [UI_MENU_OFF] = "Off", [UI_MENU_AUTO] = "Automatic", [UI_MENU_DEFAULT_MARK] = "default",
     [UI_MENU_AFTER_RESTART] = "after restart", [UI_MENU_SET_BY_ENV] = "set by environment variable",

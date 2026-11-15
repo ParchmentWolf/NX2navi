@@ -34,7 +34,11 @@ extern "C" {
 #include "ui/menu.h"
 #include "vk_xr.h"
 #include "vr_game.h"
+#include "xr_depth_keep_spv.h"
+#include "xr_depth_spv.h"
 #include "xr_hud_spv.h"
+int vk_dlaa_vr_planes(float planes[2]);                     // vk_dlaa.h
+void rec_drain(void);                                        // vk_rec.h
 }
 
 namespace {
@@ -59,9 +63,12 @@ struct Pose {
 // shown on the screen
 struct Drawn {
     bool tracked = false;
-    bool hud = false;   // the HUD apart: the box holds the scene without it, the HUD box its panel
-    Pose pose;
+    bool hud = false;      // the HUD apart: the box holds the scene without it, the HUD box its panel
+    bool stereo = false;   // depth stereo: the box holds the left eye's picture, the right box the right eye's
+    Pose pose;             // the head's, between the eyes
     Lens lens;
+    float scale = 1.0f;    // the lens the game drew with over the one shown (NX2NAVI_VR_VIEW_SCALE)
+    float ipd = 0.064f;    // the eyes' distance, metres
 };
 
 struct Xr {
@@ -88,7 +95,7 @@ struct Xr {
     uint32_t width = 0, height = 0;
     // the boxes (mu): the present's thread writes one, the session's thread reads the newest
     std::mutex mu;
-    VkImage boxes[3]{};
+    VkImage boxes[3]{}, boxes_r[3]{};   // (the right eye's, depth stereo)
     uint64_t box_value[3]{};
     int latest = -1, reading = -1, next_slot = 0, pending = -1;
     bool boxes_made = false, boxes_failed = false;
@@ -99,6 +106,7 @@ struct Xr {
     bool have_head = false;
     Pose head;
     Lens eyes;   // both eyes' lenses together
+    float ipd = 0.064f;
     std::atomic<bool> running{false};
     // the view now (each present): the head's on the game's camera, or the screen (NX2NAVI_VR_VIEW, the menu open)
     std::atomic<bool> head_view{false};
@@ -133,6 +141,29 @@ struct Xr {
     VkImage hud_boxes[3]{};
     std::atomic<uint32_t> panels{0};
     std::atomic<uint32_t> pic_w{0}, pic_h{0};   // the game's presented picture's size: the HUD's target is the scene upscaled to it
+    // depth stereo (NX2NAVI_VR_DEPTH, hud_mu): shaders/xr_depth.comp makes each eye's picture from the scene the HUD's
+    // shader leaves and the scene's depth kept by vk_xr_keep_depth
+    VkImage eye8[2]{};
+    VkImageView eye8_view[2]{};
+    uint32_t eye8_w = 0, eye8_h = 0;
+    // the scene's depth as it was when the scene was drawn (vk_xr_keep_depth): the game reuses its target for smaller
+    // passes before the present
+    VkImage depth = VK_NULL_HANDLE;   // R32F
+    VkImageView depth_view = VK_NULL_HANDLE;
+    uint32_t depth_w = 0, depth_h = 0;
+    uint64_t depth_kept = 0;
+    VkDescriptorSetLayout keep_set = VK_NULL_HANDLE;
+    VkPipelineLayout keep_layout = VK_NULL_HANDLE;
+    VkPipeline keep_pipe = VK_NULL_HANDLE;
+    VkSampler keep_sampler = VK_NULL_HANDLE;
+    PFN_vkCmdPushDescriptorSetKHR keep_push = nullptr;
+    bool keep_tried = false;
+    VkDescriptorSetLayout depth_set = VK_NULL_HANDLE;
+    VkPipelineLayout depth_layout = VK_NULL_HANDLE;
+    VkPipeline depth_pipe = VK_NULL_HANDLE;
+    VkSampler linear = VK_NULL_HANDLE;
+    bool depth_tried = false;
+    std::atomic<uint32_t> stereo_pictures{0}, stereo_missed{0};
 };
 
 Xr &xr() {
@@ -253,7 +284,8 @@ bool listed(const char *const *list, uint32_t n, const char *name) {
     return false;
 }
 
-void barrier(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayout to) {
+void barrier(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayout to,
+             VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT) {
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
@@ -261,7 +293,7 @@ void barrier(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayou
     b.oldLayout = from, b.newLayout = to;
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = image;
-    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b.subresourceRange = {aspect, 0, 1, 0, 1};
     VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     d.imageMemoryBarrierCount = 1, d.pImageMemoryBarriers = &b;
     vkCmdPipelineBarrier2(cb, &d);
@@ -306,8 +338,8 @@ bool make_boxes(VkFormat window) {
     }
     VkPhysicalDeviceMemoryProperties mem;
     vkGetPhysicalDeviceMemoryProperties(x.phys, &mem);
-    for (int k = 0; k < 6; k++) {   // the pictures' three, then the HUD's
-        VkImage &box = k < 3 ? x.boxes[k] : x.hud_boxes[k - 3];
+    for (int k = 0; k < 9; k++) {   // the pictures' three, the HUD's, the right eye's
+        VkImage &box = k < 3 ? x.boxes[k] : k < 6 ? x.hud_boxes[k - 3] : x.boxes_r[k - 6];
         VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ci.imageType = VK_IMAGE_TYPE_2D;
         ci.format = format;
@@ -335,7 +367,8 @@ bool make_boxes(VkFormat window) {
 }
 
 // A device-local 2D image (one level, one layer) and a view of it; UNDEFINED until the caller's barrier
-bool make_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage, VkImage &image, VkImageView &view) {
+bool make_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage, VkImage &image, VkImageView &view,
+                VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT) {
     Xr &x = xr();
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ci.imageType = VK_IMAGE_TYPE_2D, ci.format = format, ci.extent = {w, h, 1};
@@ -355,7 +388,7 @@ bool make_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage
         vkBindImageMemory(x.device, image, dm, 0) != VK_SUCCESS)
         return false;
     VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    vc.image = image, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = format, vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vc.image = image, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = format, vc.subresourceRange = {aspect, 0, 1, 0, 1};
     return vkCreateImageView(x.device, &vc, nullptr, &view) == VK_SUCCESS;
 }
 
@@ -375,7 +408,7 @@ bool make_hud_pipeline() {
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 4, li.pBindings = b;
     if (vkCreateDescriptorSetLayout(x.device, &li, nullptr, &x.hud_set) != VK_SUCCESS) return false;
-    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(int32_t) * 2};
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(int32_t) * 3};
     VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pi.setLayoutCount = 1, pi.pSetLayouts = &x.hud_set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
     if (vkCreatePipelineLayout(x.device, &pi, nullptr, &x.hud_layout) != VK_SUCCESS) return false;
@@ -393,9 +426,9 @@ bool make_hud_pipeline() {
 
 bool hud_wanted() { return strcmp(cfg_value("NX2NAVI_VR_HUD"), "panel") == 0; }
 
-// (vk_xr_capture, hud_mu held) the scene without the HUD and the HUD's panel made from the target as it is now and the
-// scene kept from before the HUD; false when there is nothing new to make them from
-bool make_panel(VkCommandBuffer cb) {
+// (vk_xr_capture, hud_mu held) the scene without the HUD (with it: keep_hud) and the HUD's panel made from the target as
+// it is now and the scene kept from before the HUD; false when there is nothing new to make them from
+bool make_panel(VkCommandBuffer cb, bool keep_hud) {
     Xr &x = xr();
     if (!x.scene || !x.hud_target || x.kept == x.used) return false;
     if (!x.hud_tried) {
@@ -408,7 +441,7 @@ bool make_panel(VkCommandBuffer cb) {
     if (!x.hud_pipe) return false;
     if (!x.scene8) {
         const VkImageUsageFlags u = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-        if (!make_image(x.hud_w, x.hud_h, VK_FORMAT_R8G8B8A8_UNORM, u, x.scene8, x.scene8_view) ||
+        if (!make_image(x.hud_w, x.hud_h, VK_FORMAT_R8G8B8A8_UNORM, u | VK_IMAGE_USAGE_SAMPLED_BIT, x.scene8, x.scene8_view) ||
             !make_image(x.hud_w, x.hud_h, VK_FORMAT_R8G8B8A8_UNORM, u, x.panel8, x.panel8_view)) {
             x.hud_pipe = VK_NULL_HANDLE;
             return false;
@@ -439,11 +472,126 @@ bool make_panel(VkCommandBuffer cb) {
         w[i].pImageInfo = &info[i];
     }
     x.push_set(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.hud_layout, 0, 4, w);
-    const int32_t pc[2] = {(int32_t)x.hud_w, (int32_t)x.hud_h};
+    const int32_t pc[3] = {(int32_t)x.hud_w, (int32_t)x.hud_h, keep_hud ? 1 : 0};
     vkCmdPushConstants(cb, x.hud_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
     vkCmdDispatch(cb, (x.hud_w + 7) / 8, (x.hud_h + 7) / 8, 1);
     barrier(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
     x.panels++;
+    return true;
+}
+
+// The depth stereo shader (shaders/xr_depth.comp): the scene and its depth sampled, the eye's RGBA8 image out
+bool make_depth_pipeline() {
+    Xr &x = xr();
+    if (!x.push_set) return false;
+    VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (vkCreateSampler(x.device, &si, nullptr, &x.linear) != VK_SUCCESS) return false;
+    const VkDescriptorSetLayoutBinding b[3] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                               {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                               {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+    VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 3, li.pBindings = b;
+    if (vkCreateDescriptorSetLayout(x.device, &li, nullptr, &x.depth_set) != VK_SUCCESS) return false;
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(float) * 7};
+    VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pi.setLayoutCount = 1, pi.pSetLayouts = &x.depth_set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
+    if (vkCreatePipelineLayout(x.device, &pi, nullptr, &x.depth_layout) != VK_SUCCESS) return false;
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = sizeof xr_depth_spv, mi.pCode = xr_depth_spv;
+    VkShaderModule m = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(x.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", nullptr};
+    ci.layout = x.depth_layout;
+    const VkResult r = vkCreateComputePipelines(x.device, VK_NULL_HANDLE, 1, &ci, nullptr, &x.depth_pipe);
+    vkDestroyShaderModule(x.device, m, nullptr);
+    return r == VK_SUCCESS;
+}
+
+// The depth copy's shader (shaders/xr_depth_keep.comp), made on the thread that records the scene: the scene's depth
+// sampled, an R32F storage image out
+bool make_keep_pipeline() {
+    Xr &x = xr();
+    x.keep_push = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(x.device, "vkCmdPushDescriptorSetKHR");
+    if (!x.keep_push) return false;
+    VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    si.magFilter = si.minFilter = VK_FILTER_NEAREST;
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (vkCreateSampler(x.device, &si, nullptr, &x.keep_sampler) != VK_SUCCESS) return false;
+    const VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                               {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+    VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 2, li.pBindings = b;
+    if (vkCreateDescriptorSetLayout(x.device, &li, nullptr, &x.keep_set) != VK_SUCCESS) return false;
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(int32_t) * 2};
+    VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pi.setLayoutCount = 1, pi.pSetLayouts = &x.keep_set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
+    if (vkCreatePipelineLayout(x.device, &pi, nullptr, &x.keep_layout) != VK_SUCCESS) return false;
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = sizeof xr_depth_keep_spv, mi.pCode = xr_depth_keep_spv;
+    VkShaderModule m = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(x.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", nullptr};
+    ci.layout = x.keep_layout;
+    const VkResult r = vkCreateComputePipelines(x.device, VK_NULL_HANDLE, 1, &ci, nullptr, &x.keep_pipe);
+    vkDestroyShaderModule(x.device, m, nullptr);
+    return r == VK_SUCCESS;
+}
+
+// (vk_xr_capture, hud_mu held, after make_panel) each eye's picture from the scene make_panel left in scene8 and this
+// present's scene depth: the eye half the eyes' distance (NX2NAVI_VR_DEPTH percent of it) to its side of the head's
+// view; false without the depth (the head's view then shows the one picture to both eyes)
+bool make_eyes(VkCommandBuffer cb, const Drawn &d) {
+    Xr &x = xr();
+    float planes[2];
+    if (!vk_dlaa_vr_planes(planes) || !x.depth_kept) {
+        x.stereo_missed++;
+        return false;
+    }
+    if (!x.depth_tried) {
+        x.depth_tried = true;
+        if (!make_depth_pipeline()) {
+            rt_log("vr: the depth stereo shader could not be made: one picture to both eyes");
+            x.depth_pipe = VK_NULL_HANDLE;
+        }
+    }
+    if (!x.depth_pipe) return false;
+    if (!x.eye8[0] || x.eye8_w != x.hud_w || x.eye8_h != x.hud_h) {   // (another size's are left behind, as the scene's)
+        for (int e = 0; e < 2; e++)
+            if (!make_image(x.hud_w, x.hud_h, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                            x.eye8[e], x.eye8_view[e])) {
+                rt_log("vr: the depth stereo eye images %ux%u could not be made: one picture to both eyes", x.hud_w, x.hud_h);
+                x.depth_pipe = VK_NULL_HANDLE;
+                return false;
+            }
+        x.eye8_w = x.hud_w, x.eye8_h = x.hud_h;
+        rt_log("vr: depth stereo: eye pictures %ux%u", x.hud_w, x.hud_h);
+    }
+    const float tan_x = d.lens.r * d.scale;   // the game's lens: x_ndc = view x / (z tan_x)
+    const float strength = 0.01f * (float)cfg_int("NX2NAVI_VR_DEPTH");
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.depth_pipe);
+    for (int e = 0; e < 2; e++) {
+        barrier(cb, x.eye8[e], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        const VkDescriptorImageInfo info[3] = {{x.linear, x.scene8_view, VK_IMAGE_LAYOUT_GENERAL},
+                                               {x.nearest, x.depth_view, VK_IMAGE_LAYOUT_GENERAL},
+                                               {VK_NULL_HANDLE, x.eye8_view[e], VK_IMAGE_LAYOUT_GENERAL}};
+        VkWriteDescriptorSet w[3]{};
+        for (uint32_t i = 0; i < 3; i++) {
+            w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, w[i].dstBinding = i, w[i].descriptorCount = 1;
+            w[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w[i].pImageInfo = &info[i];
+        }
+        x.push_set(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.depth_layout, 0, 3, w);
+        const float side = (e ? 0.5f : -0.5f) * d.ipd * strength;   // the left eye to the left: the scene moves right in it
+        const float pc[7] = {(float)x.hud_w, (float)x.hud_h, side / tan_x, planes[0], planes[1], 0.08f, 1.0f / 0.05f};
+        vkCmdPushConstants(cb, x.depth_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+        vkCmdDispatch(cb, (x.hud_w + 7) / 8, (x.hud_h + 7) / 8, 1);
+        barrier(cb, x.eye8[e], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    }
+    x.stereo_pictures++;
     return true;
 }
 
@@ -504,7 +652,7 @@ void run(void *) {
         sw.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
         sw.format = format;
         sw.sampleCount = 1;
-        sw.width = x.width, sw.height = x.height;
+        sw.width = 2 * x.width, sw.height = x.height;   // the left eye's picture on the left, the right eye's beside it
         sw.faceCount = sw.arraySize = sw.mipCount = 1;
         r = x.xrCreateSwapchain(session, &sw, &swapchain);
         if (XR_FAILED(r)) {
@@ -514,6 +662,7 @@ void run(void *) {
         x.xrEnumerateSwapchainImages(swapchain, 0, &n, nullptr);
         images.assign(n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
         x.xrEnumerateSwapchainImages(swapchain, n, &n, (XrSwapchainImageBaseHeader *)images.data());
+        sw.width = x.width;
         if (XR_SUCCEEDED(x.xrCreateSwapchain(session, &sw, &hud_swapchain))) {
             uint32_t hn = 0;
             x.xrEnumerateSwapchainImages(hud_swapchain, 0, &hn, nullptr);
@@ -604,8 +753,13 @@ void run(void *) {
                 eyes.r = std::fmax(std::tan(views[0].fov.angleRight), std::tan(views[1].fov.angleRight));
                 eyes.u = std::fmax(std::tan(views[0].fov.angleUp), std::tan(views[1].fov.angleUp));
                 eyes.d = std::fmin(std::tan(views[0].fov.angleDown), std::tan(views[1].fov.angleDown));
+                const float dx = views[1].pose.position.x - views[0].pose.position.x,
+                            dy = views[1].pose.position.y - views[0].pose.position.y,
+                            dz = views[1].pose.position.z - views[0].pose.position.z;
+                const float ipd = std::sqrt(dx * dx + dy * dy + dz * dz);
                 std::lock_guard<std::mutex> lk(x.head_mu);
                 x.eyes = eyes;
+                if (ipd > 0.04f && ipd < 0.09f) x.ipd = ipd;
                 std::memcpy(x.head.q, &head.pose.orientation, sizeof x.head.q);
                 std::memcpy(x.head.p, &head.pose.position, sizeof x.head.p);
                 x.have_head = true;
@@ -673,6 +827,11 @@ void run(void *) {
                 c.extent = {x.width, x.height, 1};
                 vkCmdCopyImage(cb, x.boxes[slot], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+                if (drawn.stereo) {
+                    c.dstOffset.x = (int32_t)x.width;
+                    vkCmdCopyImage(cb, x.boxes_r[slot], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+                }
                 barrier(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
                 vkEndCommandBuffer(cb);
                 VkSemaphoreSubmitInfo w{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
@@ -704,17 +863,26 @@ void run(void *) {
         quad.pose.orientation.w = 1.0f;
         quad.pose.position.z = -x.screen_distance;
         quad.size = {x.screen_width, x.width ? x.screen_width * (float)x.height / (float)x.width : 0};
-        // a picture drawn from the head's pose: a projection layer at that pose, the same picture to both eyes; the
-        // compositor turns it with the head between the game's frames
+        // a picture drawn from the head's pose: a projection layer at that pose, the same picture to both eyes, or with
+        // depth stereo each eye's own picture at its own place, half the eyes' distance to its side; the compositor turns
+        // it with the head between the game's frames
         XrCompositionLayerProjectionView pv[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
                                                   {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
-        for (XrCompositionLayerProjectionView &v : pv) {
+        for (int e = 0; e < 2; e++) {
+            XrCompositionLayerProjectionView &v = pv[e];
             std::memcpy(&v.pose.orientation, shown_drawn.pose.q, sizeof shown_drawn.pose.q);
-            std::memcpy(&v.pose.position, shown_drawn.pose.p, sizeof shown_drawn.pose.p);
+            float at[3] = {shown_drawn.pose.p[0], shown_drawn.pose.p[1], shown_drawn.pose.p[2]};
+            if (shown_drawn.stereo) {
+                const float side[3] = {(e ? 0.5f : -0.5f) * shown_drawn.ipd, 0, 0};
+                float off[3];
+                rotate(shown_drawn.pose.q, side, off);
+                for (int c = 0; c < 3; c++) at[c] += off[c];
+            }
+            std::memcpy(&v.pose.position, at, sizeof at);
             v.fov.angleLeft = std::atan(shown_drawn.lens.l), v.fov.angleRight = std::atan(shown_drawn.lens.r);
             v.fov.angleUp = std::atan(shown_drawn.lens.u), v.fov.angleDown = std::atan(shown_drawn.lens.d);
             v.subImage.swapchain = swapchain;
-            v.subImage.imageRect = {{0, 0}, {(int32_t)x.width, (int32_t)x.height}};
+            v.subImage.imageRect = {{shown_drawn.stereo && e ? (int32_t)x.width : 0, 0}, {(int32_t)x.width, (int32_t)x.height}};
         }
         XrCompositionLayerProjection proj{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
         proj.space = space;
@@ -748,9 +916,10 @@ void run(void *) {
         const uint64_t now = plat_now_ns();
         if (now - last_log > 10000000000ull) {
             rt_log("vr: %llu headset frames (%llu with the head's view), %llu pictures copied in the last 10 s (%u drawn "
-                   "from the head, %u HUD panels made); the game's camera %u, lens %u", (unsigned long long)frames,
-                   (unsigned long long)tracked_frames, (unsigned long long)copies, x.tracked_pictures.exchange(0), x.panels.exchange(0),
-                   x.camera_given.exchange(0), x.lens_given.exchange(0));
+                   "from the head, %u HUD panels made, %u in depth stereo, %u without the scene's depth); the game's camera "
+                   "%u, lens %u", (unsigned long long)frames, (unsigned long long)tracked_frames, (unsigned long long)copies,
+                   x.tracked_pictures.exchange(0), x.panels.exchange(0), x.stereo_pictures.exchange(0),
+                   x.stereo_missed.exchange(0), x.camera_given.exchange(0), x.lens_given.exchange(0));
             frames = copies = tracked_frames = 0, last_log = now;
         }
     }
@@ -847,6 +1016,52 @@ extern "C" void vk_xr_device_ready(VkInstance instance, VkPhysicalDevice phys, V
 
 extern "C" int vk_xr_head_wanted(void) { return xr().ok && strcmp(cfg_value("NX2NAVI_VR_VIEW"), "head") == 0; }
 
+extern "C" int vk_xr_depth_wanted(void) { return vk_xr_head_wanted() && cfg_int("NX2NAVI_VR_DEPTH") > 0; }
+
+extern "C" void vk_xr_keep_depth(VkCommandBuffer cb, VkImageView depth, uint32_t w, uint32_t h) {
+    Xr &x = xr();
+    if (!x.ok || !x.head_view.load(std::memory_order_relaxed) || !depth || !w || !h) return;
+    std::lock_guard<std::mutex> lk(x.hud_mu);
+    if (!x.keep_tried) {
+        x.keep_tried = true;
+        if (!make_keep_pipeline()) {
+            rt_log("vr: the depth stereo's depth copy could not be made: one picture to both eyes");
+            x.keep_pipe = VK_NULL_HANDLE;
+        }
+    }
+    if (!x.keep_pipe) return;
+    // the replay's commands go through the recorder thread (vk_rec.h), which this file's direct calls bypass: they are
+    // made once it has made every command queued before them
+    rec_drain();
+    bool fresh = false;
+    if (!x.depth || x.depth_w != w || x.depth_h != h) {
+        x.depth = VK_NULL_HANDLE, x.depth_kept = 0;   // (another size's is left behind, as the scene's)
+        if (!make_image(w, h, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, x.depth, x.depth_view)) {
+            rt_log("vr: the depth stereo's depth image %ux%u could not be made: one picture to both eyes", w, h);
+            x.keep_pipe = VK_NULL_HANDLE;
+            return;
+        }
+        x.depth_w = w, x.depth_h = h, fresh = true;
+        rt_log("vr: depth stereo keeps the scene's depth: %ux%u", w, h);
+    }
+    barrier(cb, x.depth, fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.keep_pipe);
+    const VkDescriptorImageInfo info[2] = {{x.keep_sampler, depth, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, x.depth_view, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet wr[2]{};
+    for (uint32_t i = 0; i < 2; i++) {
+        wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, wr[i].dstBinding = i, wr[i].descriptorCount = 1;
+        wr[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        wr[i].pImageInfo = &info[i];
+    }
+    x.keep_push(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.keep_layout, 0, 2, wr);
+    const int32_t pc[2] = {(int32_t)w, (int32_t)h};
+    vkCmdPushConstants(cb, x.keep_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    vkCmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);
+    barrier(cb, x.depth, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    x.depth_kept++;
+}
+
 extern "C" int vk_xr_head_active(void) {
     Xr &x = xr();
     return x.ok && x.head_view.load(std::memory_order_relaxed) && x.running.load(std::memory_order_relaxed);
@@ -860,10 +1075,12 @@ extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3]) {
     }
     Pose head;
     Lens eyes;
+    float ipd;
     {
         std::lock_guard<std::mutex> lk(x.head_mu);
         if (!x.have_head) return 0;
         head = x.head, eyes = x.eyes;
+        ipd = x.ipd;
     }
     // the camera's facing made level (its yaw alone, so the horizon stays level whatever the game's camera does): the
     // head's axes are put on it, x right, y up, z back as OpenXR's
@@ -889,9 +1106,10 @@ extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3]) {
     std::lock_guard<std::mutex> lk(x.frame_mu);
     x.frame_on = true;
     x.drawn.tracked = true, x.drawn.pose = head, x.drawn.lens = frustum(eyes, x.picture_ratio.load());
-    // the game draws a lens this many times the one the headset is told (NX2NAVI_VR_VIEW_SCALE, 130 % by default: the
-    // world as large as it feels on a screen): more of the world in the same view, everything smaller above 100 %
+    // the game draws a lens this many times the one the headset is told (NX2NAVI_VR_VIEW_SCALE, 100 % by default: the
+    // headset's own): more of the world in the same view, everything smaller above 100 %
     x.render_scale = std::fmax(0.5f, std::fmin(2.0f, (float)cfg_int("NX2NAVI_VR_VIEW_SCALE") / 100.0f));
+    x.drawn.scale = x.render_scale, x.drawn.ipd = ipd;
     x.camera_given++;
     x.updates++;
     return 1;
@@ -916,7 +1134,8 @@ extern "C" void vk_xr_untracked(void) {
 extern "C" VkImage vk_xr_scene_image(VkImage target, uint32_t w, uint32_t h, VkFormat format, int *init) {
     Xr &x = xr();
     *init = 0;
-    if (!x.ok || !x.head_view.load(std::memory_order_relaxed) || !hud_wanted() || !target || !w || !h) return VK_NULL_HANDLE;
+    if (!x.ok || !x.head_view.load(std::memory_order_relaxed) || !(hud_wanted() || vk_xr_depth_wanted()) || !target || !w || !h)
+        return VK_NULL_HANDLE;
     // other pictures pass through the upscaler too (a 2560x1440 sRGB one): only the one of the presented picture's size
     // is the scene the HUD is drawn over
     if (w != x.pic_w.load(std::memory_order_relaxed) || h != x.pic_h.load(std::memory_order_relaxed)) return VK_NULL_HANDLE;
@@ -997,13 +1216,18 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
         std::lock_guard<std::mutex> lk(x.frame_mu);
         d = x.drawn;
     }
-    // the HUD apart (NX2NAVI_VR_HUD=panel): the head's view without it, the HUD on its panel
+    // the HUD apart (NX2NAVI_VR_HUD=panel) and depth stereo (NX2NAVI_VR_DEPTH) start from the scene kept before the HUD:
+    // the head's view without the HUD (with it where it stays in the picture), the HUD on its panel, each eye's picture
+    const bool panel = hud_wanted(), depth = d.tracked && vk_xr_depth_wanted();
+    bool made = false;
     uint32_t hw = 0, hh = 0;
-    if (d.tracked && hud_wanted()) {
+    if (d.tracked && (panel || depth)) {
         std::lock_guard<std::mutex> lk(x.hud_mu);
-        d.hud = make_panel(cb);
+        made = make_panel(cb, !panel);
         hw = x.hud_w, hh = x.hud_h;
+        if (made && depth) d.stereo = make_eyes(cb, d);
     }
+    d.hud = made && panel;
     x.box_drawn[slot] = d;
     if (d.tracked) x.tracked_pictures++;
     const VkImage box = x.boxes[slot];
@@ -1011,13 +1235,22 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
     VkImageBlit b{};
     b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     b.dstOffsets[1] = {(int32_t)x.width, (int32_t)x.height, 1};
-    if (d.hud) {
+    if (made) {
         b.srcOffsets[1] = {(int32_t)hw, (int32_t)hh, 1};
-        vkCmdBlitImage(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, box, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
-        const VkImage hb = x.hud_boxes[slot];
-        barrier(cb, hb, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        vkCmdBlitImage(cb, x.panel8, VK_IMAGE_LAYOUT_GENERAL, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
-        barrier(cb, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        vkCmdBlitImage(cb, d.stereo ? x.eye8[0] : x.scene8, VK_IMAGE_LAYOUT_GENERAL, box, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &b, VK_FILTER_LINEAR);
+        if (d.stereo) {
+            const VkImage rb = x.boxes_r[slot];
+            barrier(cb, rb, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            vkCmdBlitImage(cb, x.eye8[1], VK_IMAGE_LAYOUT_GENERAL, rb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+            barrier(cb, rb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        }
+        if (d.hud) {
+            const VkImage hb = x.hud_boxes[slot];
+            barrier(cb, hb, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            vkCmdBlitImage(cb, x.panel8, VK_IMAGE_LAYOUT_GENERAL, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+            barrier(cb, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        }
     } else if (d.tracked) {
         b.srcOffsets[0] = {rect[0], rect[1], 0};
         b.srcOffsets[1] = {rect[0] + rect[2], rect[1] + rect[3], 1};

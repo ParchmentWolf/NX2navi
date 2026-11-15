@@ -1,0 +1,39 @@
+#version 450
+// VR's depth stereo (runtime/vk_xr.cpp vk_xr_capture): an eye's picture made from the one the game drew from between
+// the eyes. A point at view distance z seen from an eye `shift` to the side moves by shift * P00 / z in clip space, half
+// that in the picture's [0, 1]. The source of an output pixel is found by stepping back from it with the distance seen
+// at the step before; at the edges of near things the gap one eye sees and the other does not takes the background.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D color;   // the scene, sRGB-encoded bytes (RGBA8 UNORM)
+layout(binding = 1) uniform sampler2D depth;   // the scene's depth (R32F, as stored), at the scene's own size
+layout(binding = 2, rgba8) uniform writeonly image2D eye;
+layout(push_constant) uniform Push {
+    vec2 size;        // the eye's picture, pixels
+    float shift;      // the eye's offset (view units, right positive) times P00
+    float plane_a;    // the stored depth d is plane_a + plane_b / distance
+    float plane_b;
+    float most;       // the largest move, in the picture's [0, 1]
+    float nearest;    // 1 / the nearest distance used, so a point at the camera does not move without end
+} p;
+
+float inv_distance(vec2 at) { return clamp((texture(depth, at).r - p.plane_a) / p.plane_b, 0.0, p.nearest); }
+
+// the nearest of the depth texel and its neighbours: a near thing's edge moves with it, whole, and the gap beside it
+// takes the stretched background rather than its edge torn off into the background
+float inv_distance_near(vec2 at) {
+    const vec2 texel = 1.0 / vec2(textureSize(depth, 0));
+    float n = inv_distance(at);
+    for (int i = -2; i <= 2; i++)
+        if (i != 0) n = max(n, inv_distance(at + vec2(float(i) * texel.x, 0.0)));
+    n = max(n, inv_distance(at + vec2(0.0, texel.y)));
+    return max(n, inv_distance(at - vec2(0.0, texel.y)));
+}
+
+void main() {
+    const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (at.x >= int(p.size.x) || at.y >= int(p.size.y)) return;
+    const vec2 uv = (vec2(at) + 0.5) / p.size;
+    float u = uv.x;
+    for (int i = 0; i < 4; i++) u = uv.x + clamp(0.5 * p.shift * inv_distance_near(vec2(u, uv.y)), -p.most, p.most);
+    imageStore(eye, at, texture(color, vec2(u, uv.y)));
+}
