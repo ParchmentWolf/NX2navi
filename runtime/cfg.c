@@ -87,7 +87,7 @@ static const char *const known[] = {
     "TEX_COMPACT", "TEX_COMPACT_MIN_MB", "TEX_COMPACT_FRAME_MB",   // texture compaction (vk_texture.c); no menu row
     "STANDIN_FILTER",   // the filter of the scene upscaler's stand-in (vk_tonemap.c); no menu row
     "VR", "VR_SCREEN_SIZE", "VR_SCREEN_CURVE", "VR_VIEW", "VR_CAMERA", "VR_EYE_UP", "VR_EYE_SIDE", "VR_EYE_FORWARD", "VR_HUD", "VR_HUD_SIZE", "VR_VIEW_SCALE",
-    "VR_DEPTH",
+    "VR_DEPTH", "VR_CONTROLS", "VR_SWING_SPEED", "VR_CHARGE_REACH",
     "PATCH_VR_LENS",   // VR through OpenXR (vk_xr.cpp, vr_game.c)
     // retired: the settings of the co-op of versions up to 0.9.2; read by nothing, listed so that a file which still
     // sets them logs no unknown key
@@ -175,6 +175,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"TEX_COMPACT", "performance"}, {"TEX_COMPACT_MIN_MB", "performance"}, {"TEX_COMPACT_FRAME_MB", "performance"},
     {"VR", "vr"}, {"VR_SCREEN_SIZE", "vr"}, {"VR_SCREEN_CURVE", "vr"}, {"VR_VIEW", "vr"}, {"VR_CAMERA", "vr"}, {"VR_EYE_UP", "vr"}, {"VR_EYE_SIDE", "vr"},
     {"VR_EYE_FORWARD", "vr"}, {"VR_HUD", "vr"}, {"VR_HUD_SIZE", "vr"}, {"VR_VIEW_SCALE", "vr"}, {"VR_DEPTH", "vr"},
+    {"VR_CONTROLS", "vr"}, {"VR_SWING_SPEED", "vr"}, {"VR_CHARGE_REACH", "vr"},
 };
 
 // The settings the menu shows: the value in effect when the key is unset, and what the key accepts. The only place a
@@ -203,6 +204,11 @@ static const CfgMeta metas[] = {
     {"VR", "0", "0|1", RESTART}, {"VR_SCREEN_SIZE", "65", "45..125", LIVE},
     {"VR_SCREEN_CURVE", "1", "0|1", LIVE}, {"VR_VIEW", "head", "screen|head", LIVE},
     // vr_game.c: the head's view from Link's eyes (first) or the game's camera (third), and the eyes' offsets in cm
+    // vk_xr.cpp: what the game is played with: the gamepad (and keys) alone, or the Touch controllers too
+    {"VR_CONTROLS", "gamepad", "gamepad|meta", LIVE},
+    // vk_xr.cpp: the hand's speed in cm a second a swing (Y) needs, and how far out from the head in cm a swing leaves it
+    // to hold the charge
+    {"VR_SWING_SPEED", "230", "100..500", LIVE}, {"VR_CHARGE_REACH", "45", "25..70", LIVE},
     {"VR_CAMERA", "first", "first|third", LIVE}, {"VR_EYE_UP", "0", "-30..30", LIVE}, {"VR_EYE_SIDE", "0", "-30..30", LIVE},
     {"VR_EYE_FORWARD", "0", "-30..30", LIVE},
     // vk_xr.cpp: the HUD on a panel in front of the head (panel) or left in the picture, and the panel's width in cm

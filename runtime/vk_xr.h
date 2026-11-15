@@ -41,6 +41,10 @@ int vk_xr_camera(double pos[3], double at[3], float up[3]);
 // vr_game.c, the same update's angle load: 1 and the vertical angle (radians) the headset's lens needs, after a
 // vk_xr_camera that applied
 int vk_xr_lens(float *angle);
+// input.c, each pad read: the hand controllers' buttons ORed onto *buttons (input_map.h bits) and each stick
+// (left[2], right[2]: x, y, up +y, -32767..32767) replaced by the controller's where it is pushed farther; 1 when a
+// controller is in use now
+int vk_xr_pad(uint64_t *buttons, int32_t left[2], int32_t right[2]);
 // The game's own view this frame (the head's view not applied); its pictures go on the screen
 void vk_xr_untracked(void);
 

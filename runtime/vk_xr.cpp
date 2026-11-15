@@ -51,7 +51,9 @@ namespace {
     X(xrCreateReferenceSpace) X(xrEnumerateSwapchainFormats) X(xrCreateSwapchain) X(xrEnumerateSwapchainImages)       \
     X(xrAcquireSwapchainImage) X(xrWaitSwapchainImage) X(xrReleaseSwapchainImage) X(xrGetVulkanInstanceExtensionsKHR) \
     X(xrGetVulkanDeviceExtensionsKHR) X(xrGetVulkanGraphicsDeviceKHR) X(xrGetVulkanGraphicsRequirementsKHR)          \
-    X(xrLocateViews) X(xrLocateSpace)
+    X(xrLocateViews) X(xrLocateSpace) X(xrStringToPath) X(xrPathToString) X(xrCreateActionSet) X(xrCreateAction)   \
+    X(xrSuggestInteractionProfileBindings) X(xrAttachSessionActionSets) X(xrSyncActions) X(xrGetActionStateBoolean)  \
+    X(xrGetActionStateFloat) X(xrGetActionStateVector2f) X(xrCreateActionSpace) X(xrGetCurrentInteractionProfile)
 
 // Tangents of a lens's four edges (left and down negative), as OpenXR's angles are
 struct Lens {
@@ -170,6 +172,14 @@ struct Xr {
     VkSampler linear = VK_NULL_HANDLE;
     bool depth_tried = false;
     std::atomic<uint32_t> stereo_pictures{0}, stereo_missed{0}, menu_pictures{0};
+    // the hand controllers (hands_mu; the session's thread writes, the game's input reads): their buttons as the pad's
+    // (input_map.h bits) and sticks, and the grips' poses in the LOCAL space
+    std::mutex hands_mu;
+    uint64_t hand_buttons = 0;
+    float hand_sticks[2][2]{};   // left, right; x right, y up
+    Pose grip[2];
+    bool grip_ok[2]{};
+    uint64_t hands_at = 0;   // when they were last read (plat_now_ns), 0 never
     // the last picture drawn from the head whose world scene8 and eye8 still hold (the present's thread alone): a paused
     // game's menus go on the HUD's panel in front of that world, frozen as it was
     Drawn frozen;
@@ -676,6 +686,237 @@ bool make_eyes(VkCommandBuffer cb, const Drawn &d) {
 }
 
 // The session's thread: its events, the headset's frames, and each newer box into the swapchain
+// The hand controllers through OpenXR's actions, bound for the Touch controllers (Quest), read each headset frame onto
+// the pad's buttons (input_map.h bits): A and B their own, X and Y A and B again; the left stick's click A, the right's
+// X (jump); the left grip ZL (the Z lock), the right grip ZR; the triggers L and R; the left Menu tapped Plus (the
+// inventory), held a second Minus; the right hand swung fast Y (the sword) tapped, or held while the swing went outward
+// and left the hand out to the side (the charge), until the hand comes back in. NX2NAVI_VR_CONTROLS=meta puts them on the pad (vk_xr_pad); gamepad leaves the pad to the gamepad
+struct Controls {
+    enum { A = 0, B, X, Y, STICK_L, STICK_R, L, R, ZL, ZR, PLUS, MINUS };
+    static constexpr uint64_t press_ns = 120000000ull, hold_ns = 1000000000ull;
+    XrActionSet set = XR_NULL_HANDLE;
+    XrAction stick = XR_NULL_HANDLE, click = XR_NULL_HANDLE, trigger = XR_NULL_HANDLE, squeeze = XR_NULL_HANDLE,
+             grip = XR_NULL_HANDLE, a = XR_NULL_HANDLE, b = XR_NULL_HANDLE, xb = XR_NULL_HANDLE, yb = XR_NULL_HANDLE,
+             menu = XR_NULL_HANDLE;
+    XrPath hand[2]{};
+    XrSpace grip_space[2]{};
+    bool ok = false;
+    bool trigger_on[2]{}, squeeze_on[2]{};
+    uint64_t menu_down = 0, plus_until = 0, minus_until = 0;   // plat_now_ns
+    bool minus_sent = false;
+    // the swing: the right grip's positions over the last frames (plat_now_ns). A swing starts once the speed is past
+    // swing_on (NX2NAVI_VR_SWING_SPEED), at least refractory_ns after the last one started (a swing's follow-through is
+    // not another), and ends under swing_off. Each is a tap of Y (tap_ns down, at least gap_ns up
+    // before the next, one swing more kept for then), held on as the charge when it went outward and the hand is
+    // out_on (NX2NAVI_VR_CHARGE_REACH) from the head's upright line at the tap's end, released once the hand is back
+    // within out_off, 10 cm nearer
+    static constexpr float swing_off = 1.0f;   // metres a second
+    static constexpr uint64_t refractory_ns = 300000000ull;
+    uint64_t swing_at = 0;
+    static constexpr uint64_t tap_ns = 80000000ull, gap_ns = 80000000ull;
+    float swing_p[4][3]{};
+    uint64_t swing_t[4]{};
+    int swing_n = 0;
+    bool swinging = false, outward = false, charging = false, queued = false;
+    uint64_t y_down = 0, y_up = 0;   // the tap's press and release (0: none now)
+
+    XrPath path(const char *s) {
+        XrPath p = XR_NULL_PATH;
+        xr().xrStringToPath(xr().instance, s, &p);
+        return p;
+    }
+    XrAction action(const char *name, XrActionType type, bool both) {
+        XrActionCreateInfo ai{XR_TYPE_ACTION_CREATE_INFO};
+        std::strcpy(ai.actionName, name);
+        std::strcpy(ai.localizedActionName, name);
+        ai.actionType = type;
+        ai.countSubactionPaths = both ? 2 : 0;
+        ai.subactionPaths = both ? hand : nullptr;
+        XrAction out = XR_NULL_HANDLE;
+        if (XR_FAILED(xr().xrCreateAction(set, &ai, &out))) rt_log("vr: xrCreateAction %s failed", name);
+        return out;
+    }
+    void make(XrSession session) {
+        Xr &x = xr();
+        XrActionSetCreateInfo si{XR_TYPE_ACTION_SET_CREATE_INFO};
+        std::strcpy(si.actionSetName, "gameplay");
+        std::strcpy(si.localizedActionSetName, "Gameplay");
+        XrResult r = x.xrCreateActionSet(x.instance, &si, &set);
+        if (XR_FAILED(r)) {
+            rt_log("vr: xrCreateActionSet failed (%d): no hand controllers", (int)r);
+            return;
+        }
+        hand[0] = path("/user/hand/left"), hand[1] = path("/user/hand/right");
+        stick = action("stick", XR_ACTION_TYPE_VECTOR2F_INPUT, true);
+        click = action("stick_click", XR_ACTION_TYPE_BOOLEAN_INPUT, true);
+        trigger = action("trigger", XR_ACTION_TYPE_FLOAT_INPUT, true);
+        squeeze = action("squeeze", XR_ACTION_TYPE_FLOAT_INPUT, true);
+        grip = action("grip", XR_ACTION_TYPE_POSE_INPUT, true);
+        a = action("a", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+        b = action("b", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+        xb = action("x", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+        yb = action("y", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+        menu = action("menu", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+        const struct {
+            XrAction act;
+            const char *at;
+        } binds[] = {
+            {stick, "/user/hand/left/input/thumbstick"},         {stick, "/user/hand/right/input/thumbstick"},
+            {click, "/user/hand/left/input/thumbstick/click"},   {click, "/user/hand/right/input/thumbstick/click"},
+            {trigger, "/user/hand/left/input/trigger/value"},    {trigger, "/user/hand/right/input/trigger/value"},
+            {squeeze, "/user/hand/left/input/squeeze/value"},    {squeeze, "/user/hand/right/input/squeeze/value"},
+            {grip, "/user/hand/left/input/grip/pose"},           {grip, "/user/hand/right/input/grip/pose"},
+            {a, "/user/hand/right/input/a/click"},               {b, "/user/hand/right/input/b/click"},
+            {xb, "/user/hand/left/input/x/click"},               {yb, "/user/hand/left/input/y/click"},
+            {menu, "/user/hand/left/input/menu/click"},
+        };
+        XrActionSuggestedBinding sb[sizeof binds / sizeof binds[0]];
+        for (size_t i = 0; i < sizeof binds / sizeof binds[0]; i++) sb[i] = {binds[i].act, path(binds[i].at)};
+        XrInteractionProfileSuggestedBinding pb{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+        pb.interactionProfile = path("/interaction_profiles/oculus/touch_controller");
+        pb.countSuggestedBindings = sizeof sb / sizeof sb[0];
+        pb.suggestedBindings = sb;
+        r = x.xrSuggestInteractionProfileBindings(x.instance, &pb);
+        if (XR_FAILED(r)) {
+            rt_log("vr: the Touch controllers' bindings were refused (%d): no hand controllers", (int)r);
+            return;
+        }
+        XrSessionActionSetsAttachInfo at{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+        at.countActionSets = 1, at.actionSets = &set;
+        r = x.xrAttachSessionActionSets(session, &at);
+        if (XR_FAILED(r)) {
+            rt_log("vr: xrAttachSessionActionSets failed (%d): no hand controllers", (int)r);
+            return;
+        }
+        for (int h = 0; h < 2; h++) {
+            XrActionSpaceCreateInfo sci{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+            sci.action = grip, sci.subactionPath = hand[h];
+            sci.poseInActionSpace.orientation.w = 1.0f;
+            x.xrCreateActionSpace(session, &sci, &grip_space[h]);
+        }
+        ok = true;
+        rt_log("vr: hand controllers bound (Touch)");
+    }
+    bool on(XrSession session, XrAction act, XrPath sub) {
+        XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
+        gi.action = act, gi.subactionPath = sub;
+        XrActionStateBoolean st{XR_TYPE_ACTION_STATE_BOOLEAN};
+        return XR_SUCCEEDED(xr().xrGetActionStateBoolean(session, &gi, &st)) && st.isActive && st.currentState;
+    }
+    float value(XrSession session, XrAction act, XrPath sub) {
+        XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
+        gi.action = act, gi.subactionPath = sub;
+        XrActionStateFloat st{XR_TYPE_ACTION_STATE_FLOAT};
+        return XR_SUCCEEDED(xr().xrGetActionStateFloat(session, &gi, &st)) && st.isActive ? st.currentState : 0.0f;
+    }
+    // this headset frame's buttons, sticks and grips (time: the frame's predicted display time) into the Xr's
+    void read(XrSession session, XrSpace space, XrTime time, const float head[3]) {
+        if (!ok) return;
+        Xr &x = xr();
+        XrActiveActionSet active{set, XR_NULL_PATH};
+        XrActionsSyncInfo sy{XR_TYPE_ACTIONS_SYNC_INFO};
+        sy.countActiveActionSets = 1, sy.activeActionSets = &active;
+        if (x.xrSyncActions(session, &sy) != XR_SUCCESS) return;   // (XR_SESSION_NOT_FOCUSED: nothing to read)
+        const uint64_t now = plat_now_ns();
+        uint64_t bits = 0;
+        const auto set_bit = [&](int bit, bool down) { bits |= down ? 1ull << bit : 0; };
+        set_bit(A, on(session, a, XR_NULL_PATH) || on(session, xb, XR_NULL_PATH) || on(session, click, hand[0]));
+        set_bit(B, on(session, b, XR_NULL_PATH) || on(session, yb, XR_NULL_PATH));
+        set_bit(X, on(session, click, hand[1]));
+        for (int h = 0; h < 2; h++) {   // pressed past 0.6, released under 0.4
+            const float t = value(session, trigger, hand[h]), s = value(session, squeeze, hand[h]);
+            trigger_on[h] = trigger_on[h] ? t > 0.4f : t > 0.6f;
+            squeeze_on[h] = squeeze_on[h] ? s > 0.4f : s > 0.6f;
+        }
+        set_bit(L, trigger_on[0]), set_bit(R, trigger_on[1]);
+        set_bit(ZL, squeeze_on[0]), set_bit(ZR, squeeze_on[1]);
+        // the Menu: a tap is Plus for a moment at its release, a second's hold Minus for a moment then
+        if (on(session, menu, XR_NULL_PATH)) {
+            if (!menu_down) menu_down = now, minus_sent = false;
+            if (!minus_sent && now - menu_down >= hold_ns) minus_until = now + press_ns, minus_sent = true;
+        } else if (menu_down) {
+            if (!minus_sent) plus_until = now + press_ns;
+            menu_down = 0;
+        }
+        set_bit(PLUS, now < plus_until), set_bit(MINUS, now < minus_until);
+        float sticks[2][2]{};
+        for (int h = 0; h < 2; h++) {
+            XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
+            gi.action = stick, gi.subactionPath = hand[h];
+            XrActionStateVector2f st{XR_TYPE_ACTION_STATE_VECTOR2F};
+            if (XR_SUCCEEDED(x.xrGetActionStateVector2f(session, &gi, &st)) && st.isActive)
+                sticks[h][0] = st.currentState.x, sticks[h][1] = st.currentState.y;
+        }
+        Pose poses[2];
+        bool pose_ok[2]{};
+        for (int h = 0; h < 2; h++) {
+            XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
+            const XrSpaceLocationFlags need = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+            if (grip_space[h] && XR_SUCCEEDED(x.xrLocateSpace(grip_space[h], space, time, &loc)) &&
+                (loc.locationFlags & need) == need) {
+                std::memcpy(poses[h].q, &loc.pose.orientation, sizeof poses[h].q);
+                std::memcpy(poses[h].p, &loc.pose.position, sizeof poses[h].p);
+                pose_ok[h] = true;
+            }
+        }
+        const float swing_on = 0.01f * (float)cfg_int("NX2NAVI_VR_SWING_SPEED");   // metres a second
+        const float out_on = 0.01f * (float)cfg_int("NX2NAVI_VR_CHARGE_REACH"), out_off = out_on - 0.1f;   // metres
+        bool swung = false;
+        float out = 0.0f;   // the hand's distance from the head's upright line
+        if (pose_ok[1]) {   // the velocity over the last 4 frames
+            const float hx = poses[1].p[0] - head[0], hz = poses[1].p[2] - head[2];
+            out = std::sqrt(hx * hx + hz * hz);
+            const int i = swing_n++ & 3;
+            std::memcpy(swing_p[i], poses[1].p, sizeof swing_p[i]);
+            swing_t[i] = now;
+            if (swing_n >= 4) {
+                const int o = swing_n & 3;   // the oldest
+                const float dt = (float)(swing_t[i] - swing_t[o]) * 1e-9f;
+                float v[3];
+                for (int c = 0; c < 3; c++) v[c] = dt > 0 ? (swing_p[i][c] - swing_p[o][c]) / dt : 0.0f;
+                const float speed = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+                if (!swinging && speed > swing_on && now - swing_at >= refractory_ns) {
+                    swinging = swung = true;
+                    swing_at = now;
+                    // outward: most of the motion away from the head's upright line
+                    outward = out > 0.05f && (v[0] * hx + v[2] * hz) / out > 0.6f * speed;
+                } else if (swinging && speed < swing_off) {
+                    swinging = false;
+                }
+            }
+        } else swing_n = 0, swinging = false;
+        if (swung) queued = true;
+        if (charging) {
+            queued = false;   // (the hand brought back in fast is the release, not a swing)
+            if (out < out_off || !pose_ok[1]) charging = false, y_down = 0, y_up = now;
+        } else if (y_down) {
+            if (now - y_down >= tap_ns) {
+                if (outward && out > out_on) charging = true;
+                else y_down = 0, y_up = now;
+            }
+        }
+        if (!y_down && queued && now - y_up >= gap_ns) y_down = now, queued = false, outward = outward && swinging;
+        set_bit(Y, y_down != 0);
+        std::lock_guard<std::mutex> lk(x.hands_mu);
+        x.hand_buttons = bits;
+        std::memcpy(x.hand_sticks, sticks, sizeof sticks);
+        for (int h = 0; h < 2; h++) x.grip[h] = poses[h], x.grip_ok[h] = pose_ok[h];
+        x.hands_at = now;
+    }
+    void log_profile(XrSession session) {
+        if (!ok) return;
+        Xr &x = xr();
+        for (int h = 0; h < 2; h++) {
+            XrInteractionProfileState ps{XR_TYPE_INTERACTION_PROFILE_STATE};
+            char name[XR_MAX_PATH_LENGTH] = "none";
+            uint32_t n = 0;
+            if (XR_SUCCEEDED(x.xrGetCurrentInteractionProfile(session, hand[h], &ps)) && ps.interactionProfile != XR_NULL_PATH)
+                x.xrPathToString(x.instance, ps.interactionProfile, sizeof name, &n, name);
+            rt_log("vr: the %s hand's controller: %s", h ? "right" : "left", name);
+        }
+    }
+};
+
 void run(void *) {
     Xr &x = xr();
     XrGraphicsBindingVulkanKHR binding{XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
@@ -766,6 +1007,8 @@ void run(void *) {
         return true;
     };
     rt_log("vr: session made");
+    Controls controls;
+    controls.make(session);
 
     bool running = false, have_image = false;
     uint64_t shown = 0, frames = 0, copies = 0, tracked_frames = 0;
@@ -790,6 +1033,8 @@ void run(void *) {
                 } else if (s->state == XR_SESSION_STATE_EXITING || s->state == XR_SESSION_STATE_LOSS_PENDING) {
                     quit = true;
                 }
+            } else if (ev.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
+                controls.log_profile(session);
             } else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
                 quit = true;
             }
@@ -844,6 +1089,14 @@ void run(void *) {
                 std::memcpy(x.head.p, &head.pose.position, sizeof x.head.p);
                 x.have_head = true;
             }
+        }
+        {
+            float head_p[3];
+            {
+                std::lock_guard<std::mutex> lk(x.head_mu);
+                std::memcpy(head_p, x.head.p, sizeof head_p);
+            }
+            controls.read(session, space, fs.predictedDisplayTime, head_p);
         }
 
         int slot = -1;
@@ -1019,6 +1272,13 @@ void run(void *) {
                    "game's camera %u, lens %u", (unsigned long long)frames, (unsigned long long)tracked_frames,
                    (unsigned long long)copies, x.tracked_pictures.exchange(0), x.panels.exchange(0), x.stereo_pictures.exchange(0),
                    x.stereo_missed.exchange(0), x.menu_pictures.exchange(0), x.camera_given.exchange(0), x.lens_given.exchange(0));
+            {
+                std::lock_guard<std::mutex> lk(x.hands_mu);
+                rt_log("vr: hands: buttons %#llx, sticks %.2f %.2f / %.2f %.2f, grips %s %s (left at %.2f %.2f %.2f)",
+                       (unsigned long long)x.hand_buttons, x.hand_sticks[0][0], x.hand_sticks[0][1], x.hand_sticks[1][0],
+                       x.hand_sticks[1][1], x.grip_ok[0] ? "tracked" : "lost", x.grip_ok[1] ? "tracked" : "lost",
+                       x.grip[0].p[0], x.grip[0].p[1], x.grip[0].p[2]);
+            }
             frames = copies = tracked_frames = 0, last_log = now;
         }
     }
@@ -1172,6 +1432,32 @@ extern "C" void vk_xr_keep_depth(VkCommandBuffer cb, VkImageView depth, uint32_t
 extern "C" int vk_xr_head_active(void) {
     Xr &x = xr();
     return x.ok && x.head_view.load(std::memory_order_relaxed) && x.running.load(std::memory_order_relaxed);
+}
+
+extern "C" int vk_xr_pad(uint64_t *buttons, int32_t left[2], int32_t right[2]) {
+    Xr &x = xr();
+    if (!x.ok || !x.running.load() || strcmp(cfg_value("NX2NAVI_VR_CONTROLS"), "meta") != 0) return 0;
+    uint64_t bits;
+    float sticks[2][2];
+    {
+        std::lock_guard<std::mutex> lk(x.hands_mu);
+        if (!x.hands_at || plat_now_ns() - x.hands_at > 250000000ull) return 0;   // not read for a while: not focused
+        bits = x.hand_buttons;
+        std::memcpy(sticks, x.hand_sticks, sizeof sticks);
+    }
+    int used = bits != 0;
+    int32_t *out[2] = {left, right};
+    for (int h = 0; h < 2; h++) {   // a small dead zone, then the stick farther out of the two (the gamepad's or this)
+        const float m = std::sqrt(sticks[h][0] * sticks[h][0] + sticks[h][1] * sticks[h][1]);
+        if (m < 0.12f) continue;
+        const float k = std::fmin(1.0f, (m - 0.12f) / 0.88f) / m;
+        const int32_t sx = (int32_t)(sticks[h][0] * k * 32767.0f), sy = (int32_t)(sticks[h][1] * k * 32767.0f);
+        if ((int64_t)sx * sx + (int64_t)sy * sy > (int64_t)out[h][0] * out[h][0] + (int64_t)out[h][1] * out[h][1])
+            out[h][0] = sx, out[h][1] = sy;
+        used = 1;
+    }
+    *buttons |= bits;
+    return used;
 }
 
 extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3]) {

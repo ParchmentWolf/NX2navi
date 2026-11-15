@@ -72,6 +72,19 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_VR_SCREEN_CURVE] = "Curved screen",
     [UI_MENU_VR_SCREEN_CURVE_DESC] = "Curves the floating screen around you, like a cinema's, so its edges stay as near as "
                                      "its middle. Off: a flat screen.",
+    [UI_MENU_VR_GROUP_CONTROLS] = "Controls", [UI_MENU_VR_CONTROLS] = "Control scheme",
+    [UI_MENU_VR_CONTROLS_PAD] = "GamePad", [UI_MENU_VR_CONTROLS_META] = "Meta/Oculus",
+    [UI_MENU_VR_CONTROLS_PAD_DESC] = "Play with a normal controller (or the keyboard and mouse), as without VR.",
+    [UI_MENU_VR_CONTROLS_META_DESC] = "Play with the headset's Touch controllers (a gamepad still works alongside). "
+        "A/B: the game's own A/B. X/Y: mirror A/B. L3: mirrors A (roll, run, accept). R3: mirrors X (jump). "
+        "Triggers and grips: L/R and ZL/ZR. Menu pressed: + (primary menu). Menu held: - (secondary menu). "
+        "Swinging the right hand: Y (sword).",
+    [UI_MENU_VR_SWING_SPEED] = "Swing speed",
+    [UI_MENU_VR_SWING_SPEED_DESC] = "How fast your hand must move for a swing to count as a sword slash (Meta/Oculus). "
+        "Lower: gentler swings slash. Higher: only strong swings do.",
+    [UI_MENU_VR_CHARGE_REACH] = "Charge reach",
+    [UI_MENU_VR_CHARGE_REACH_DESC] = "How far out from your body a swing must leave your hand to keep charging the sword "
+        "(Meta/Oculus); bringing the hand back in releases it. Lower suits shorter arms.",
     [UI_MENU_VR_SCALE] = "Field of view",
     [UI_MENU_VR_SCALE_DESC] = "How much of the world the view takes in. The default, 100%, matches the headset's lenses exactly. "
         "Higher fits more of the world into your view, so everything looks smaller; lower zooms in. Away from 100%, "

@@ -1810,6 +1810,15 @@ static void tab_vr(float scale) {
     opt_slider("NX2NAVI_VR_EYE_UP", UI_MENU_VR_EYE_UP, -30, 30, UI_MENU_VR_EYE_UP_DESC, 1, "%+.0f cm");
     opt_slider("NX2NAVI_VR_EYE_SIDE", UI_MENU_VR_EYE_SIDE, -30, 30, UI_MENU_VR_EYE_SIDE_DESC, 1, "%+.0f cm");
     opt_slider("NX2NAVI_VR_EYE_FORWARD", UI_MENU_VR_EYE_FORWARD, -30, 30, UI_MENU_VR_EYE_FORWARD_DESC, 1, "%+.0f cm");
+    opt_group(UI_MENU_VR_GROUP_CONTROLS);
+    {   // the description of the scheme chosen: its buttons
+        static const UiTextId schemes[] = {UI_MENU_VR_CONTROLS_PAD, UI_MENU_VR_CONTROLS_META};
+        const bool meta = strcmp(cfg_value("NX2NAVI_VR_CONTROLS"), "meta") == 0;
+        opt_choice("NX2NAVI_VR_CONTROLS", UI_MENU_VR_CONTROLS, schemes, 2,
+                   meta ? UI_MENU_VR_CONTROLS_META_DESC : UI_MENU_VR_CONTROLS_PAD_DESC);
+    }
+    opt_slider("NX2NAVI_VR_SWING_SPEED", UI_MENU_VR_SWING_SPEED, 100, 500, UI_MENU_VR_SWING_SPEED_DESC, 10, "%.0f cm/s");
+    opt_slider("NX2NAVI_VR_CHARGE_REACH", UI_MENU_VR_CHARGE_REACH, 25, 70, UI_MENU_VR_CHARGE_REACH_DESC, 1, "%.0f cm");
     opt_group(UI_MENU_VR_GROUP_HUD);
     static const UiTextId huds[] = {UI_MENU_VR_HUD_PANEL, UI_MENU_VR_HUD_PICTURE};
     opt_choice("NX2NAVI_VR_HUD", UI_MENU_VR_HUD, huds, 2, UI_MENU_VR_HUD_DESC);
