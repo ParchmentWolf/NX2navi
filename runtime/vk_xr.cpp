@@ -817,8 +817,7 @@ bool make_eyes(VkCommandBuffer cb, const Drawn &d) {
 }
 
 // The hand controllers through OpenXR's actions, bound for the Touch controllers (Quest), read each headset frame onto
-// the pad's buttons (input_map.h bits): A and B their own, X and Y A and B again; the left stick's click A, the right's
-// X (jump); the left grip ZL (the Z lock), the right grip ZR; the left Menu tapped Plus (the inventory), held a second
+// the pad's buttons (input_map.h bits): A and B their own, X and Y A and B again; either stick's click X (jump); the left grip ZL (the Z lock), the right grip ZR; the left Menu tapped Plus (the inventory), held a second
 // Minus; the sword hand (NX2NAVI_VR_HANDEDNESS, the left by default) swung fast Y tapped, or held while the swing went
 // outward and left the hand out to the side (the charge), until the hand comes back in. The left trigger held opens the D-pad wheel, the right one the
 // item wheel (vr_wheel.c; ui/menu.cpp draws them): that hand's stick held toward a slot picks it and the trigger's
@@ -967,9 +966,9 @@ struct Controls {
         const uint64_t now = plat_now_ns();
         uint64_t bits = 0;
         const auto set_bit = [&](int bit, bool down) { bits |= down ? 1ull << bit : 0; };
-        set_bit(A, on(session, a, XR_NULL_PATH) || on(session, xb, XR_NULL_PATH) || on(session, click, hand[0]));
+        set_bit(A, on(session, a, XR_NULL_PATH) || on(session, xb, XR_NULL_PATH));
         set_bit(B, on(session, b, XR_NULL_PATH) || on(session, yb, XR_NULL_PATH));
-        set_bit(X, on(session, click, hand[1]));
+        set_bit(X, on(session, click, hand[0]) || on(session, click, hand[1]));
         for (int h = 0; h < 2; h++) {   // pressed past 0.6, released under 0.4
             const float t = value(session, trigger, hand[h]), s = value(session, squeeze, hand[h]);
             trigger_on[h] = trigger_on[h] ? t > 0.4f : t > 0.6f;
