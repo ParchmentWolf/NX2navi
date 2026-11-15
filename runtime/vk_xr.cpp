@@ -65,6 +65,8 @@ struct Drawn {
     bool tracked = false;
     bool hud = false;      // the HUD apart: the box holds the scene without it, the HUD box its panel
     bool stereo = false;   // depth stereo: the box holds the left eye's picture, the right box the right eye's
+    bool menu = false;     // the game paused (its menus): the boxes hold the world as it last was, the HUD box the
+                           // game's picture, its menu, shown on the HUD's panel
     Pose pose;             // the head's, between the eyes
     Lens lens;
     float scale = 1.0f;    // the lens the game drew with over the one shown (NX2NAVI_VR_VIEW_SCALE)
@@ -163,7 +165,10 @@ struct Xr {
     VkPipeline depth_pipe = VK_NULL_HANDLE;
     VkSampler linear = VK_NULL_HANDLE;
     bool depth_tried = false;
-    std::atomic<uint32_t> stereo_pictures{0}, stereo_missed{0};
+    std::atomic<uint32_t> stereo_pictures{0}, stereo_missed{0}, menu_pictures{0};
+    // the last picture drawn from the head whose world scene8 and eye8 still hold (the present's thread alone): a paused
+    // game's menus go on the HUD's panel in front of that world, frozen as it was
+    Drawn frozen;
 };
 
 Xr &xr() {
@@ -809,7 +814,8 @@ void run(void *) {
             vkResetFences(x.device, 1, &fence);
             return true;
         };
-        if (slot >= 0 && drawn.hud && hud_swapchain) hud_has = copy_into(hud_swapchain, hud_images, x.hud_boxes[slot]);
+        if (slot >= 0 && (drawn.hud || drawn.menu) && hud_swapchain)
+            hud_has = copy_into(hud_swapchain, hud_images, x.hud_boxes[slot]);
         if (slot >= 0) {
             uint32_t index = 0;
             XrSwapchainImageAcquireInfo acq{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
@@ -902,6 +908,8 @@ void run(void *) {
             const float wide = 0.01f * (float)cfg_int("NX2NAVI_VR_HUD_SIZE");
             hud.size = {wide, x.width ? wide * (float)x.height / (float)x.width : 0};
         }
+        // the paused game's menus go on the HUD's panel, over the world as it was
+        const bool show_menu = shown_drawn.tracked && shown_drawn.menu && hud_has && hud_swapchain;
         const bool show_hud = shown_drawn.tracked && shown_drawn.hud && hud_has && hud_swapchain;
         const XrCompositionLayerBaseHeader *layers[] = {shown_drawn.tracked ? (const XrCompositionLayerBaseHeader *)&proj
                                                                             : (const XrCompositionLayerBaseHeader *)&quad,
@@ -910,17 +918,17 @@ void run(void *) {
         XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
         ei.displayTime = fs.predictedDisplayTime;
         ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-        ei.layerCount = have_image && fs.shouldRender ? (show_hud ? 2 : 1) : 0;
+        ei.layerCount = have_image && fs.shouldRender ? (show_hud || show_menu ? 2 : 1) : 0;
         ei.layers = layers;
         r = x.xrEndFrame(session, &ei);
         if (XR_FAILED(r)) rt_log("vr: xrEndFrame failed (%d)", (int)r);
         const uint64_t now = plat_now_ns();
         if (now - last_log > 10000000000ull) {
             rt_log("vr: %llu headset frames (%llu with the head's view), %llu pictures copied in the last 10 s (%u drawn "
-                   "from the head, %u HUD panels made, %u in depth stereo, %u without the scene's depth); the game's camera "
-                   "%u, lens %u", (unsigned long long)frames, (unsigned long long)tracked_frames, (unsigned long long)copies,
-                   x.tracked_pictures.exchange(0), x.panels.exchange(0), x.stereo_pictures.exchange(0),
-                   x.stereo_missed.exchange(0), x.camera_given.exchange(0), x.lens_given.exchange(0));
+                   "from the head, %u HUD panels made, %u in depth stereo, %u without the scene's depth, %u paused); the "
+                   "game's camera %u, lens %u", (unsigned long long)frames, (unsigned long long)tracked_frames,
+                   (unsigned long long)copies, x.tracked_pictures.exchange(0), x.panels.exchange(0), x.stereo_pictures.exchange(0),
+                   x.stereo_missed.exchange(0), x.menu_pictures.exchange(0), x.camera_given.exchange(0), x.lens_given.exchange(0));
             frames = copies = tracked_frames = 0, last_log = now;
         }
     }
@@ -1213,9 +1221,42 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
     // gameplay camera update put on it; else the window for the screen
     Drawn d;
     x.stale = x.updates.exchange(0) ? 0 : x.stale + 1;
-    if (x.head_view.load(std::memory_order_relaxed) && have_picture && x.stale < 3) {
+    const bool head = x.head_view.load(std::memory_order_relaxed) && have_picture;
+    if (head && x.stale < 3) {
         std::lock_guard<std::mutex> lk(x.frame_mu);
         d = x.drawn;
+    }
+    if (!head) x.frozen.tracked = false;
+    if (head && x.stale >= 3 && x.frozen.tracked) {   // paused: the frozen world, and the game's picture on the HUD's panel
+        d = x.frozen;
+        d.hud = false, d.menu = true;
+        x.box_drawn[slot] = d;
+        x.menu_pictures++;
+        VkImageBlit b{};
+        b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.dstOffsets[1] = {(int32_t)x.width, (int32_t)x.height, 1};
+        {
+            std::lock_guard<std::mutex> lk(x.hud_mu);
+            b.srcOffsets[1] = {(int32_t)x.hud_w, (int32_t)x.hud_h, 1};
+            for (int e = 0; e < (d.stereo ? 2 : 1); e++) {
+                const VkImage bx = e ? x.boxes_r[slot] : x.boxes[slot];
+                barrier(cb, bx, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                vkCmdBlitImage(cb, d.stereo ? x.eye8[e] : x.scene8, VK_IMAGE_LAYOUT_GENERAL, bx,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+                barrier(cb, bx, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            }
+        }
+        const VkImage hb = x.hud_boxes[slot];
+        barrier(cb, hb, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        b.srcOffsets[0] = {rect[0], rect[1], 0};
+        b.srcOffsets[1] = {rect[0] + rect[2], rect[1] + rect[3], 1};
+        vkCmdBlitImage(cb, picture, picture_layout, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+        barrier(cb, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        x.pending = slot;
+        signal->semaphore = x.timeline;
+        signal->value = ++x.next_value;
+        signal->stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        return;
     }
     // the HUD apart (NX2NAVI_VR_HUD=panel) and depth stereo (NX2NAVI_VR_DEPTH) start from the scene kept before the HUD:
     // the head's view without the HUD (with it where it stays in the picture), the HUD on its panel, each eye's picture
@@ -1229,6 +1270,7 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
         if (made && depth) d.stereo = make_eyes(cb, d);
     }
     d.hud = made && panel;
+    if (d.tracked && made) x.frozen = d;   // its world stays in scene8 and eye8 until the next one made
     x.box_drawn[slot] = d;
     if (d.tracked) x.tracked_pictures++;
     const VkImage box = x.boxes[slot];
