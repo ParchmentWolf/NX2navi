@@ -1800,6 +1800,8 @@ static void tab_vr(float scale) {
     opt_group(UI_MENU_VR_GROUP_VIEW);
     static const UiTextId views[] = {UI_MENU_VR_VIEW_SCREEN, UI_MENU_VR_VIEW_HEAD};
     opt_choice("NX2NAVI_VR_VIEW", UI_MENU_VR_VIEW, views, 2, UI_MENU_VR_VIEW_DESC);
+    opt_slider("NX2NAVI_VR_SCREEN_SIZE", UI_MENU_VR_SCREEN_SIZE, 45, 125, UI_MENU_VR_SCREEN_SIZE_DESC, 5, "%.0f degrees");
+    opt_toggle("NX2NAVI_VR_SCREEN_CURVE", UI_MENU_VR_SCREEN_CURVE, UI_MENU_VR_SCREEN_CURVE_DESC);
     static const UiTextId cameras[] = {UI_MENU_VR_CAMERA_FIRST, UI_MENU_VR_CAMERA_THIRD};
     opt_choice("NX2NAVI_VR_CAMERA", UI_MENU_VR_CAMERA, cameras, 2, UI_MENU_VR_CAMERA_DESC);
     opt_slider("NX2NAVI_VR_VIEW_SCALE", UI_MENU_VR_SCALE, 50, 200, UI_MENU_VR_SCALE_DESC, 5, "%.0f %%");

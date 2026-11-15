@@ -1,5 +1,6 @@
 // VR through OpenXR (vk_xr.h), NX2NAVI_VR=1 at start. Stage one, the theater: the picture the window shows, the menu
-// over it, on a screen floating in front of the headset (NX2NAVI_VR_SCREEN=<width m>,<distance m>, 3.2,2.5).
+// over it, on a screen floating in front of the headset, 2.5 m away: NX2NAVI_VR_SCREEN_SIZE degrees of the view wide,
+// curved around the head (NX2NAVI_VR_SCREEN_CURVE, a cylinder layer where the runtime has one) or flat.
 //
 // The loader is opened at run time (libopenxr_loader.so.1, openxr_loader.dll), so a PC without it starts as before.
 // XR_KHR_vulkan_enable: the runtime names the Vulkan instance and device extensions it needs and the GPU it draws with;
@@ -84,7 +85,8 @@ struct Xr {
     XrSystemId system = XR_NULL_SYSTEM_ID;
     std::string instance_exts, device_exts;   // the runtime's lists, split in place: the pointers below point into them
     std::vector<const char *> instance_list, device_list;
-    float screen_width = 3.2f, screen_distance = 2.5f;
+    const float screen_distance = 2.5f;
+    bool cylinder = false;   // the runtime has XR_KHR_composition_layer_cylinder (enabled)
     // the device (vk_xr_device_ready)
     VkInstance vk_instance = VK_NULL_HANDLE;
     VkPhysicalDevice phys = VK_NULL_HANDLE;
@@ -193,10 +195,6 @@ bool init() {
     if (x.tried) return x.ok;
     x.tried = true;
     if (!cfg_bool("NX2NAVI_VR")) return false;
-    if (const char *e = cfg_get("NX2NAVI_VR_SCREEN")) {
-        float w = 0, d = 0;
-        if (std::sscanf(e, "%f,%f", &w, &d) == 2 && w > 0.1f && d > 0.1f) x.screen_width = w, x.screen_distance = d;
-    }
 #ifdef _WIN32
     void *lib = plat_lib_open("openxr_loader.dll");
 #else
@@ -230,17 +228,21 @@ bool init() {
     std::vector<XrExtensionProperties> exts(n, {XR_TYPE_EXTENSION_PROPERTIES});
     enumerate(nullptr, n, &n, exts.data());
     bool vulkan = false;
-    for (const auto &e : exts) vulkan |= !std::strcmp(e.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
+    for (const auto &e : exts) {
+        vulkan |= !std::strcmp(e.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
+        x.cylinder |= !std::strcmp(e.extensionName, XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
+    }
+    if (!x.cylinder) rt_log("vr: the runtime has no %s: the screen stays flat", XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
     if (!vulkan) {
         rt_log("vr: the OpenXR runtime has no %s (is its server running?): VR off", XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
         return false;
     }
-    const char *want[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME};
+    const char *want[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME};
     XrInstanceCreateInfo ci{XR_TYPE_INSTANCE_CREATE_INFO};
     std::strcpy(ci.applicationInfo.applicationName, "NX2navi");
     std::strcpy(ci.applicationInfo.engineName, "NX2navi");
     ci.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
-    ci.enabledExtensionCount = 1;
+    ci.enabledExtensionCount = x.cylinder ? 2 : 1;
     ci.enabledExtensionNames = want;
     XrResult r = create(&ci, &x.instance);
     if (XR_FAILED(r)) {
@@ -690,8 +692,8 @@ void run(void *) {
         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         vkCreateFence(x.device, &fi, nullptr, &fence);
         x.ready.store(true, std::memory_order_release);
-        rt_log("vr: swapchain made: %ux%u, %u images, format %lld, queue %u of family %u; the screen %.2f m wide at %.2f m",
-               x.width, x.height, n, (long long)format, x.queue_index, x.family, x.screen_width, x.screen_distance);
+        rt_log("vr: swapchain made: %ux%u, %u images, format %lld, queue %u of family %u; the screen %.2f m away",
+               x.width, x.height, n, (long long)format, x.queue_index, x.family, x.screen_distance);
         return true;
     };
     rt_log("vr: session made");
@@ -865,6 +867,10 @@ void run(void *) {
             x.reading = -1;
         }
 
+        // the screen: NX2NAVI_VR_SCREEN_SIZE degrees of the view wide, screen_distance away, an arc of a cylinder around
+        // the head or a flat quad
+        const float wide = 3.14159265f / 180.0f * (float)cfg_int("NX2NAVI_VR_SCREEN_SIZE");
+        const float ratio = x.height ? (float)x.width / (float)x.height : 16.0f / 9.0f;
         XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
         quad.space = space;
         quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
@@ -872,7 +878,17 @@ void run(void *) {
         quad.subImage.imageRect = {{0, 0}, {(int32_t)x.width, (int32_t)x.height}};
         quad.pose.orientation.w = 1.0f;
         quad.pose.position.z = -x.screen_distance;
-        quad.size = {x.screen_width, x.width ? x.screen_width * (float)x.height / (float)x.width : 0};
+        const float flat_w = 2.0f * x.screen_distance * std::tan(0.5f * std::fmin(wide, 2.6f));
+        quad.size = {flat_w, flat_w / ratio};
+        XrCompositionLayerCylinderKHR curve{XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR};
+        curve.space = space;
+        curve.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        curve.subImage = quad.subImage;
+        curve.pose.orientation.w = 1.0f;   // the head's start in the middle, the arc ahead (-z)
+        curve.radius = x.screen_distance;
+        curve.centralAngle = wide;
+        curve.aspectRatio = ratio;   // the arc's length over its height
+        const bool curved = x.cylinder && cfg_bool("NX2NAVI_VR_SCREEN_CURVE");
         // a picture drawn from the head's pose: a projection layer at that pose, the same picture to both eyes, or with
         // depth stereo each eye's own picture at its own place, half the eyes' distance to its side; the compositor turns
         // it with the head between the game's frames
@@ -914,8 +930,10 @@ void run(void *) {
         // the paused game's menus go on the HUD's panel, over the world as it was
         const bool show_menu = shown_drawn.tracked && shown_drawn.menu && hud_has && hud_swapchain;
         const bool show_hud = shown_drawn.tracked && shown_drawn.hud && hud_has && hud_swapchain;
+        const XrCompositionLayerBaseHeader *screen = curved ? (const XrCompositionLayerBaseHeader *)&curve
+                                                            : (const XrCompositionLayerBaseHeader *)&quad;
         const XrCompositionLayerBaseHeader *layers[] = {shown_drawn.tracked ? (const XrCompositionLayerBaseHeader *)&proj
-                                                                            : (const XrCompositionLayerBaseHeader *)&quad,
+                                                                            : screen,
                                                         (const XrCompositionLayerBaseHeader *)&hud};
         if (shown_drawn.tracked) tracked_frames++;
         XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};

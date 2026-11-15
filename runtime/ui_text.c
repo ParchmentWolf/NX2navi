@@ -66,6 +66,12 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_VR_DEPTH] = "Depth",
     [UI_MENU_VR_DEPTH_DESC] = "How strongly each eye sees the world from its own side, made from the game's one picture and its "
                               "depth. 100% matches your eyes' own distance; 0% shows both eyes the same flat picture.",
+    [UI_MENU_VR_SCREEN_SIZE] = "Screen size",
+    [UI_MENU_VR_SCREEN_SIZE_DESC] = "How much of your view the floating screen fills, in degrees across: Theater mode, this "
+                                    "menu and the title.",
+    [UI_MENU_VR_SCREEN_CURVE] = "Curved screen",
+    [UI_MENU_VR_SCREEN_CURVE_DESC] = "Curves the floating screen around you, like a cinema's, so its edges stay as near as "
+                                     "its middle. Off: a flat screen.",
     [UI_MENU_VR_SCALE] = "Field of view",
     [UI_MENU_VR_SCALE_DESC] = "How much of the world the view takes in. The default, 100%, matches the headset's lenses exactly. "
         "Higher fits more of the world into your view, so everything looks smaller; lower zooms in. Away from 100%, "
