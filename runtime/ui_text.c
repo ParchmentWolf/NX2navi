@@ -82,7 +82,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
         "to swap what it holds (bombs or bombchus, the arrows, the seed or beans). Menu pressed: + (primary menu). "
         "Menu held: - (secondary menu). "
         "Swinging the sword hand: Y (sword). Both hands together behind your head: draw the sword and shield, or put "
-        "them away. Shield hand held level and across in front of you: Z (target). "
+        "them away. Shield facing ahead, held before the eye on its side: Z (target). "
         "Playing the ocarina: the right stick's left, up, right and down play Y, X, A and R, the A button L.",
     [UI_MENU_VR_HANDEDNESS] = "Handedness", [UI_MENU_VR_HANDEDNESS_RIGHT] = "Right-handed",
     [UI_MENU_VR_HANDEDNESS_LEFT] = "Left-handed",

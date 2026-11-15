@@ -1210,8 +1210,8 @@ bool make_eyes(VkCommandBuffer cb, const Drawn &d) {
 // outward and left the hand out to the side (the charge), until the hand comes back in. The left trigger held opens the D-pad wheel, the right one the
 // item wheel (vr_wheel.c; ui/menu.cpp draws them): that hand's stick held toward a slot picks it and the trigger's
 // release uses it (the D-pad's direction pressed, or the item equipped by vr_game.c), a flick toward a slot swaps what
-// it holds. The shield hand's controller laid level and across the head's middle holds ZL (the Z lock), as Link holds
-// his shield. Both hands brought together behind the head draw the sword and shield (a tap of Y) or, while they are out,
+// it holds. The shield hand's shield turned to face ahead before its own side's eye holds ZL (the Z lock), as Link
+// holds his shield. Both hands brought together behind the head draw the sword and shield (a tap of Y) or, while they are out,
 // put them away (B). While Link plays the ocarina (vk_xr_ocarina) the notes swap places: the right stick's left, up, right and
 // down play Y, X, A and R, the A button L; no sword, jump or wheel meanwhile. NX2NAVI_VR_CONTROLS=meta puts them on the
 // pad (vk_xr_pad); gamepad leaves the pad to the gamepad.
@@ -1260,7 +1260,7 @@ struct Controls {
     static constexpr float behind_on = 0.03f, shoulder_drop = 0.30f, together_on = 0.25f, apart_off = 0.35f;
     static constexpr uint64_t draw_refractory_ns = 800000000ull;
     bool draw_armed = true;
-    static constexpr float shield_on = 0.52f, shield_off = 0.87f, shield_reach = 0.70f;   // radians, radians, metres
+    static constexpr float shield_on = 0.79f, shield_off = 1.05f, shield_reach = 0.70f;   // radians, radians, metres
     bool shielding = false;
     uint64_t draw_at = 0, draw_until = 0;
     int draw_bit = -1;
@@ -1465,22 +1465,24 @@ struct Controls {
             }
             if (!draw_armed && (d2 > apart_off * apart_off || behind[0] < 0 || behind[1] < 0)) draw_armed = true;
         }
-        // the shield: the other hand's controller laid about level (its grip's -z within shield_on of the horizontal), as
-        // a forearm holds a shield, and brought across the head's middle to the sword's side holds ZL (the Z lock) until
-        // it tilts past shield_off, comes back to its own side or is held out past shield_reach
+        // the shield: the other hand's shield (drawn on the back of the hand, its face out of the grip's -x on the left
+        // hand and +x on the right) turned to face ahead (within shield_on of the head's level forward) and held before
+        // its own side's eye (within 12 cm of it to either side, 19 to stay) holds ZL (the Z lock) until it turns away
+        // past shield_off, moves off from before the eye or is held out past shield_reach
         {
             const int shield = strcmp(cfg_value("NX2NAVI_VR_HANDEDNESS"), "right") == 0 ? 0 : 1;
             bool keep = false;
             if (pose_ok[shield]) {
-                static const float tube[3] = {0, 0, -1};
-                float t[3];
-                rotate(poses[shield].q, tube, t);
-                const float tilt = std::fabs(t[1]);   // the sine of its angle from the horizontal
-                const float across = shield ? -side[shield] : side[shield];   // past the middle toward the sword's side
+                const float out_of[3] = {shield ? 1.0f : -1.0f, 0, 0};
+                float f[3];
+                rotate(poses[shield].q, out_of, f);
+                const float ahead = f[0] * fx + f[2] * fz;   // the cosine of its face's angle from straight ahead
+                // across from its own side's eye (about 3 cm out from the head's middle), either way
+                const float off_eye = std::fabs((shield ? side[shield] : -side[shield]) - 0.032f);
                 const float dx = poses[shield].p[0] - head[0], dz = poses[shield].p[2] - head[2];
                 const bool near = dx * dx + dz * dz < shield_reach * shield_reach;
-                keep = shielding ? tilt < std::sin(shield_off) && across > -0.03f && near
-                                 : tilt < std::sin(shield_on) && across > 0.02f && near;
+                keep = shielding ? ahead > std::cos(shield_off) && off_eye < 0.19f && near
+                                 : ahead > std::cos(shield_on) && off_eye < 0.12f && near;
             }
             shielding = keep && !x.ocarina.load();
             if (shielding) set_bit(ZL, true);
