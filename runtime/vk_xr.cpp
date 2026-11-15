@@ -751,8 +751,8 @@ bool make_eyes(VkCommandBuffer cb, const Drawn &d) {
 // The hand controllers through OpenXR's actions, bound for the Touch controllers (Quest), read each headset frame onto
 // the pad's buttons (input_map.h bits): A and B their own, X and Y A and B again; the left stick's click A, the right's
 // X (jump); the left grip ZL (the Z lock), the right grip ZR; the left Menu tapped Plus (the inventory), held a second
-// Minus; the right hand swung fast Y (the sword) tapped, or held while the swing went outward and left the hand out to
-// the side (the charge), until the hand comes back in. The left trigger held opens the D-pad wheel, the right one the
+// Minus; the sword hand (NX2NAVI_VR_HANDEDNESS, the left by default) swung fast Y tapped, or held while the swing went
+// outward and left the hand out to the side (the charge), until the hand comes back in. The left trigger held opens the D-pad wheel, the right one the
 // item wheel (vr_wheel.c; ui/menu.cpp draws them): that hand's stick held toward a slot picks it and the trigger's
 // release uses it (the D-pad's direction pressed, or the item equipped by vr_game.c), a flick toward a slot swaps what
 // it holds. NX2NAVI_VR_CONTROLS=meta puts them on the pad (vk_xr_pad); gamepad leaves the pad to the gamepad.
@@ -781,7 +781,7 @@ struct Controls {
     bool trigger_on[2]{}, squeeze_on[2]{};
     uint64_t menu_down = 0, plus_until = 0, minus_until = 0;   // plat_now_ns
     bool minus_sent = false;
-    // the swing: the right grip's positions over the last frames (plat_now_ns). A swing starts once the speed is past
+    // the swing: the sword hand's grip positions over the last frames (plat_now_ns). A swing starts once the speed is past
     // swing_on (NX2NAVI_VR_SWING_SPEED), at least refractory_ns after the last one started (a swing's follow-through is
     // not another), and ends under swing_off. Each is a tap of Y (tap_ns down, at least gap_ns up
     // before the next, one swing more kept for then), held on as the charge when it went outward and the hand is
@@ -793,7 +793,7 @@ struct Controls {
     static constexpr uint64_t tap_ns = 80000000ull, gap_ns = 80000000ull;
     float swing_p[4][3]{};
     uint64_t swing_t[4]{};
-    int swing_n = 0;
+    int swing_n = 0, swing_hand = 1;
     bool swinging = false, outward = false, charging = false, queued = false;
     uint64_t y_down = 0, y_up = 0;   // the tap's press and release (0: none now)
 
@@ -969,11 +969,13 @@ struct Controls {
         const float out_on = 0.01f * (float)cfg_int("NX2NAVI_VR_CHARGE_REACH"), out_off = out_on - 0.1f;   // metres
         bool swung = false;
         float out = 0.0f;   // the hand's distance from the head's upright line
-        if (pose_ok[1]) {   // the velocity over the last 4 frames
-            const float hx = poses[1].p[0] - head[0], hz = poses[1].p[2] - head[2];
+        const int sword = strcmp(cfg_value("NX2NAVI_VR_HANDEDNESS"), "right") == 0 ? 1 : 0;   // the swinging hand
+        if (sword != swing_hand) swing_hand = sword, swing_n = 0, swinging = false;
+        if (pose_ok[sword]) {   // the velocity over the last 4 frames
+            const float hx = poses[sword].p[0] - head[0], hz = poses[sword].p[2] - head[2];
             out = std::sqrt(hx * hx + hz * hz);
             const int i = swing_n++ & 3;
-            std::memcpy(swing_p[i], poses[1].p, sizeof swing_p[i]);
+            std::memcpy(swing_p[i], poses[sword].p, sizeof swing_p[i]);
             swing_t[i] = now;
             if (swing_n >= 4) {
                 const int o = swing_n & 3;   // the oldest
@@ -994,7 +996,7 @@ struct Controls {
         if (swung) queued = true;
         if (charging) {
             queued = false;   // (the hand brought back in fast is the release, not a swing)
-            if (out < out_off || !pose_ok[1]) charging = false, y_down = 0, y_up = now;
+            if (out < out_off || !pose_ok[sword]) charging = false, y_down = 0, y_up = now;
         } else if (y_down) {
             if (now - y_down >= tap_ns) {
                 if (outward && out > out_on) charging = true;
