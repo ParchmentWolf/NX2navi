@@ -228,6 +228,7 @@ struct Xr {
     std::atomic<uint64_t> wheel_closed_at{0};   // plat_now_ns at a wheel's close
     std::atomic<bool> ocarina{false};   // vr_game.c: Link plays the ocarina (the controllers' Ocarina mode)
     std::atomic<bool> weapon_out{false};   // vr_game.c: Link holds his sword and shield (or another weapon) out
+    std::atomic<bool> in_play{false};      // vr_game.c: play (not a menu, a pause, an event): the grips' and swing's play roles
     // the last picture drawn from the head whose world scene8 and eye8 still hold (the present's thread alone): a paused
     // game's menus go on the HUD's panel in front of that world, frozen as it was
     Drawn frozen;
@@ -1263,6 +1264,8 @@ struct Controls {
     static constexpr float behind_on = 0.03f, shoulder_drop = 0.30f, together_on = 0.25f, apart_off = 0.35f;
     static constexpr uint64_t draw_refractory_ns = 800000000ull;
     bool draw_armed = true;
+    bool grip_zr[2]{};   // in play: the item button held by that grip (pressed behind the head, or with an item out)
+    int tap_bit = Y;     // what the swing's tap presses: Y (the sword) or ZR (the hammer, the stick, an empty bottle)
     static constexpr float shield_on = 0.79f, shield_off = 1.05f, shield_reach = 0.70f;   // radians, radians, metres
     bool shielding = false;
     uint64_t draw_at = 0, draw_until = 0;
@@ -1372,12 +1375,14 @@ struct Controls {
         set_bit(A, on(session, a, XR_NULL_PATH) || on(session, xb, XR_NULL_PATH));
         set_bit(B, on(session, b, XR_NULL_PATH) || on(session, yb, XR_NULL_PATH));
         set_bit(X, on(session, click, hand[0]) || on(session, click, hand[1]));
+        bool squeezed_before[2] = {squeeze_on[0], squeeze_on[1]};
         for (int h = 0; h < 2; h++) {   // pressed past 0.6, released under 0.4
             const float t = value(session, trigger, hand[h]), s = value(session, squeeze, hand[h]);
             trigger_on[h] = trigger_on[h] ? t > 0.4f : t > 0.6f;
             squeeze_on[h] = squeeze_on[h] ? s > 0.4f : s > 0.6f;
         }
-        set_bit(ZL, squeeze_on[0]), set_bit(ZR, squeeze_on[1]);
+        const bool in_play = x.in_play.load();
+        if (!in_play) set_bit(ZL, squeeze_on[0]), set_bit(ZR, squeeze_on[1]);   // menus and events: the grips as ever
         // the Menu: a tap is Plus for a moment at its release, a second's hold Minus for a moment then
         if (on(session, menu, XR_NULL_PATH)) {
             if (!menu_down) menu_down = now, minus_sent = false;
@@ -1468,6 +1473,23 @@ struct Controls {
             }
             if (!draw_armed && (d2 > apart_off * apart_off || behind[0] < 0 || behind[1] < 0)) draw_armed = true;
         }
+        // in play the grips are the item button alone (no Z lock: the shield's raise holds it): pressed with that hand
+        // behind the head it takes the item out, and held while the grip stays held (reach back, draw forward, let go);
+        // with an item out either grip uses it. Which item is out: vr_game.c's (vk_xr_hand_item)
+        char held_item[96];
+        {
+            std::lock_guard<std::mutex> lk(x.gear_mu);
+            std::memcpy(held_item, x.gear[2], sizeof held_item);
+        }
+        if (in_play) {
+            for (int h = 0; h < 2; h++) {
+                if (squeeze_on[h] && !squeezed_before[h]) grip_zr[h] = held_item[0] || behind[h] > behind_on;
+                if (!squeeze_on[h]) grip_zr[h] = false;
+            }
+            set_bit(ZR, grip_zr[0] || grip_zr[1]);
+        } else {
+            grip_zr[0] = grip_zr[1] = false;
+        }
         // the shield: the other hand's shield (drawn on the back of the hand, its face out of the grip's -x on the left
         // hand and +x on the right) turned to face ahead (within shield_on of the head's level forward) and held before
         // its own side's eye (within 12 cm of it to either side, 19 to stay) holds ZL (the Z lock) until it turns away
@@ -1531,8 +1553,15 @@ struct Controls {
                 else y_down = 0, y_up = now;
             }
         }
-        if (!y_down && queued && now - y_up >= gap_ns) y_down = now, queued = false, outward = outward && swinging;
-        set_bit(Y, y_down != 0);
+        if (!y_down && queued && now - y_up >= gap_ns) {
+            // what the swing does in play: the sword out (no item) its swing, Y; the hammer, the Deku Stick or an empty
+            // bottle out their use, ZR (the hammer's or stick's swing, the bottle's scoop); else nothing
+            const bool swinger = strstr(held_item, "Hammer") || strstr(held_item, "DekuStick") || !strcmp(held_item, "Item_Bottle");
+            tap_bit = !in_play ? Y : swinger ? ZR : !held_item[0] && x.weapon_out.load() ? Y : -1;
+            queued = false;
+            if (tap_bit >= 0) y_down = now, outward = outward && swinging && tap_bit == Y;   // (the charge: the sword's)
+        }
+        if (tap_bit >= 0) set_bit(tap_bit, y_down != 0);
         if (now < draw_until) set_bit(draw_bit, true);
         if (ocarina) {   // the notes: the right stick's left, up, right and down Y, X, A and R; the A button L
             const bool a_down = bits & (1ull << A);
@@ -2138,6 +2167,8 @@ extern "C" void vk_xr_wheel_allow(int allow) { xr().wheel_allowed.store(allow !=
 extern "C" void vk_xr_ocarina(int on) { xr().ocarina.store(on != 0); }
 
 extern "C" void vk_xr_weapon_out(int out) { xr().weapon_out.store(out != 0); }
+
+extern "C" void vk_xr_in_play(int on) { xr().in_play.store(on != 0); }
 
 extern "C" void vk_xr_hand_item(const char *model) {
     Xr &x = xr();

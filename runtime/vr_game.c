@@ -288,6 +288,7 @@ void vr_tick(Cpu *c) {
     const int camera = !hooks_on || plat_now_ns() - play_at < 200000000ull;   // (without the hooks: Link's state alone)
     const int play = camera && !event_playing() && state[0] && strncmp(state, "Demo", 4);
     vk_xr_wheel_allow(open || (play && !(p || pre || post)));
+    vk_xr_in_play(play && !(p || pre || post));
     static int pending_slot = -1, pending_wait;
     int used_kind, used_slot;
     if (vk_xr_wheel_used(&used_kind, &used_slot) && used_kind == VR_WHEEL_ITEMS) pending_slot = used_slot, pending_wait = 12;
