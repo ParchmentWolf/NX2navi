@@ -18,6 +18,7 @@
 #include "third_party/openxr/include/openxr/openxr.h"
 #include "third_party/openxr/include/openxr/openxr_platform.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -577,6 +578,7 @@ bool make_eyes(VkCommandBuffer cb, const Drawn &d) {
     }
     const float tan_x = d.lens.r * d.scale;   // the game's lens: x_ndc = view x / (z tan_x)
     const float strength = 0.01f * (float)cfg_int("NX2NAVI_VR_DEPTH");
+    const float near_inv = 1.0f / 0.01f;   // a guard alone: everything has its own depth down to a centimetre
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.depth_pipe);
     for (int e = 0; e < 2; e++) {
         barrier(cb, x.eye8[e], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
@@ -591,8 +593,9 @@ bool make_eyes(VkCommandBuffer cb, const Drawn &d) {
         }
         x.push_set(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.depth_layout, 0, 3, w);
         const float side = (e ? 0.5f : -0.5f) * d.ipd * strength;   // the left eye to the left: the scene moves right in it
-        // nothing nearer than 30 cm moves more than it would there: the gaps beside the nearest things stay narrow
-        const float pc[7] = {(float)x.hud_w, (float)x.hud_h, side / tan_x, planes[0], planes[1], 0.08f, 1.0f / 0.3f};
+        // the largest move, at most a quarter of the picture: the shader scans no further
+        const float most = std::min(0.25f, 0.5f * std::fabs(side / tan_x) * near_inv + 0.002f);
+        const float pc[7] = {(float)x.hud_w, (float)x.hud_h, side / tan_x, planes[0], planes[1], most, near_inv};
         vkCmdPushConstants(cb, x.depth_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
         vkCmdDispatch(cb, (x.hud_w + 7) / 8, (x.hud_h + 7) / 8, 1);
         barrier(cb, x.eye8[e], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
