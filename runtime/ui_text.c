@@ -46,9 +46,9 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_VR] = "VR", [UI_MENU_VR_DESC] = "Shows the game in a VR headset through OpenXR (for example WiVRn on Linux, with "
         "the headset connected before the game starts). Applies after a restart.",
     [UI_MENU_VR_GROUP_VIEW] = "View", [UI_MENU_VR_GROUP_EYES] = "Eye position", [UI_MENU_VR_GROUP_HUD] = "HUD",
-    [UI_MENU_VR_VIEW] = "View", [UI_MENU_VR_VIEW_SCREEN] = "Screen", [UI_MENU_VR_VIEW_HEAD] = "Head tracked",
-    [UI_MENU_VR_VIEW_DESC] = "Head tracked: the game's camera follows your head and the world surrounds you. Screen: the game "
-        "on a large screen floating in front of you. Cutscenes and this menu always show on the screen.",
+    [UI_MENU_VR_VIEW] = "VR mode", [UI_MENU_VR_VIEW_SCREEN] = "Theater", [UI_MENU_VR_VIEW_HEAD] = "Immersive",
+    [UI_MENU_VR_VIEW_DESC] = "Immersive: the world surrounds you in play and in cutscenes, and the game's camera follows "
+        "your head. Theater: the game on a large screen floating in front of you. This menu always shows on the screen.",
     [UI_MENU_VR_CAMERA] = "Camera", [UI_MENU_VR_CAMERA_FIRST] = "First person", [UI_MENU_VR_CAMERA_THIRD] = "Third person",
     [UI_MENU_VR_CAMERA_DESC] = "First person: you see from Link's eyes, Link is hidden while what he holds stays in view, and he faces where you "
         "look while he stands. "

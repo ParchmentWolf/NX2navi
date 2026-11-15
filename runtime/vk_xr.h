@@ -41,7 +41,7 @@ int vk_xr_camera(double pos[3], double at[3], float up[3]);
 // vr_game.c, the same update's angle load: 1 and the vertical angle (radians) the headset's lens needs, after a
 // vk_xr_camera that applied
 int vk_xr_lens(float *angle);
-// vr_game.c: the game's own view this frame (an event's camera); its pictures go on the screen
+// The game's own view this frame (the head's view not applied); its pictures go on the screen
 void vk_xr_untracked(void);
 
 // vk_exec_draw.c untranslated_dispatch_fallback, the game's scene upscaled into target (w x h, format), the HUD still to
