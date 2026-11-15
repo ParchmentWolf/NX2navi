@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "debug_tools.h"
+#include "vr_names.h"
 #include "vr_wheel.h"
 
 #define ICON_DIR "UI/Tex/Icon/"
@@ -18,7 +19,7 @@ typedef struct {
     const char *value;   // the AssignableItem value
     const char *name;    // its item's name: IsGet.<name>, PouchData.<name>.StockNum, the icon <name>
     Own own;             // OWN_ARROW: IsGet.<name> and the bow
-    const char *label;   // shown under the wheel
+    const char *label;   // shown under the wheel when the game's own name is missing (vr_names.c)
     const char *ammo;    // what counts it (PouchData.<ammo>.StockNum), NULL none
 } Item;
 
@@ -253,7 +254,7 @@ static int dpad_slot(int slot, VrSlot *out) {
         snprintf(out->main.file, sizeof out->main.file, "%s", COMMON_BNTX);
         snprintf(out->main.tex, sizeof out->main.tex, "HUDNaviIcon_Body_00");
         out->now = out->main;
-        out->label = "Navi";
+        out->label = "Navi";   // (the game's item names do not name her)
         return 1;
     case 2: list = boots, n = sizeof boots / sizeof *boots; break;
     case 3: list = ocarinas, n = sizeof ocarinas / sizeof *ocarinas; break;
@@ -264,7 +265,7 @@ static int dpad_slot(int slot, VrSlot *out) {
         if (flag(key)) {
             icon_file(&out->main, list[i][0]);
             out->now = out->main;
-            out->label = list[i][1];
+            out->label = vr_item_name(list[i][0], list[i][1]);
             return 1;
         }
     }
@@ -283,7 +284,7 @@ int vr_wheel_slot(int kind, int slot, VrSlot *out) {
     if (cur < 0) return 0;
     const char *icon, *label;
     const char *value = variant(&vars[owned_idx[cur]], &icon, &label);
-    out->label = label;
+    out->label = vr_item_name(icon, label);   // (an item's icon is named as the item is)
     out->count = count_of(value, &out->max);   // (the arrows share one count, the bow's)
     icon_file(&out->now, owned_idx[cur] == 0 || !kSlots[slot].arrows ? icon : kArrowIcon[owned_idx[cur] & 3]);
     if (kSlots[slot].arrows && !vr_wheel_child()) {   // the bow, its arrows under it, the one in use framed

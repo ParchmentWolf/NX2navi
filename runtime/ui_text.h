@@ -375,6 +375,8 @@ int ui_text_game_langs(int game_version, UiGameLang *out, int max);
 // regions holds the four-letter prefix of each Mals/<region>.Product... file ("USen", "EUpl"); the version gates are
 // not used. Returns the count.
 int ui_text_game_langs_in(const char *const *regions, int nregions, UiGameLang *out, int max);
+// The Mals region a game language reads ("en-US" -> "USen"), NULL for a code not in the list
+const char *ui_text_game_mals(const char *switch_code);
 
 // Menu text: ui_text_in(menu language, id). The menu language is NX2NAVI_MENU_LANG ("en", "ru", "pt-BR", "zh-Hans");
 // unset, the system UI language when the catalog has menu text for it (English, Russian, Brazilian Portuguese,

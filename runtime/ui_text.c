@@ -2647,6 +2647,12 @@ int ui_text_game_langs(int game_version, UiGameLang *out, int max) {
     return n;
 }
 
+const char *ui_text_game_mals(const char *code) {
+    for (size_t i = 0; code && i < sizeof all_langs / sizeof *all_langs; i++)
+        if (!strcmp(code, all_langs[i].code)) return all_langs[i].mals;
+    return NULL;
+}
+
 int ui_text_game_langs_in(const char *const *regions, int nregions, UiGameLang *out, int max) {
     int n = 0;
     for (size_t i = 0; i < sizeof all_langs / sizeof *all_langs && n < max; i++)
