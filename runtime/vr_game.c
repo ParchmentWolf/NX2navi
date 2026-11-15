@@ -110,6 +110,8 @@ static int first_person_eye(double eye[3]) {
 // position in each row's fourth float). Its rotation is made the turn about the vertical toward the view. Running
 // forward, the game turns him toward his movement, which the head's view steers; sideways or back he strafes (vr_pad).
 static _Atomic uint64_t fp_at;   // when Link was last turned to the head in first person
+static _Atomic uint64_t play_at;   // when the gameplay camera last updated outside an event (plat_now_ns)
+static _Atomic int hooks_on;       // vr_game_start switched the camera hooks on: play_at is kept
 
 // Link's state's name (his component 107, the name at its +0x244: "Wait", "CrouchGuard"...), "" when there is none
 static void link_state(char out[48]) {
@@ -126,9 +128,10 @@ static void link_state(char out[48]) {
 }
 
 // The game's thread at each pad read: whether Link plays the ocarina (his state DemoOcarina), and VR's wheels. While
-// one is open vk_xr.cpp holds the game's own quick select (L), which pauses the game; a wheel does not open while the
-// game's menus pause it (its three pause steps' flags). An item wheel's slot is equipped (its era's AssignableItem
-// enum) a few reads after the release, once the quick select closed.
+// one is open vk_xr.cpp holds the game's own quick select (L), which pauses the game. A wheel opens in play alone: the
+// gameplay camera updated a moment ago (not the title, a load, an event), Link there and not in one of his scripted
+// Demo states (the ocarina among them), and the game not paused by its menus (its three pause steps' flags). An item
+// wheel's slot is equipped (its era's AssignableItem enum) a few reads after the release, once the quick select closed.
 void vr_tick(Cpu *c) {
     char state[48];
     link_state(state);
@@ -138,7 +141,9 @@ void vr_tick(Cpu *c) {
     int p = 0, pre = 0, post = 0;
     dbg_flag_get("Sequence_IsPause", &p), dbg_flag_get("Sequence_IsPreGamePause", &pre);
     dbg_flag_get("Sequence_IsPostGamePause", &post);
-    vk_xr_wheel_allow(open || !(p || pre || post));
+    const int camera = !hooks_on || plat_now_ns() - play_at < 200000000ull;   // (without the hooks: Link's state alone)
+    const int play = camera && !event_playing() && state[0] && strncmp(state, "Demo", 4);
+    vk_xr_wheel_allow(open || (play && !(p || pre || post)));
     static int pending_slot = -1, pending_wait;
     int used_kind, used_slot;
     if (vk_xr_wheel_used(&used_kind, &used_slot) && used_kind == VR_WHEEL_ITEMS) pending_slot = used_slot, pending_wait = 12;
@@ -187,6 +192,7 @@ void vr_camera_update(Cpu *c, int scene) {
     const int k = scene - 1;
     if (scene == 1) head_camera = 0;
     if (scene == 2 ? !event : event) return;   // the camera that shows: Link's in play, the events' in an event
+    if (scene == 1) play_at = plat_now_ns();
     double pos[3], at[3];
     float up[3];
     for (int i = 0; i < 3; i++) pos[i] = reg_d(c, i), at[i] = reg_d(c, 3 + i), up[i] = reg_s(c, up_reg[i]);
@@ -232,5 +238,6 @@ void vr_game_start(void) {
     }
     rt_patch_switch(lens, 1);
     dbg_camera_watch(1);   // the free camera's site, where vr_camera_update runs
+    hooks_on = 1;
     rt_log("vr: the game's camera follows the headset (NX2NAVI_VR_VIEW=head)");
 }
