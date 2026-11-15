@@ -157,13 +157,33 @@ void vr_tick(Cpu *c) {
 
 // ov_input.c npad_states: in first person play, while the left stick is pushed sideways or back the game gets ZL held,
 // so Link strafes as Z-targeting does, facing the way he faced (the head's, from running forward or standing). Pushed
-// forward (within 45 degrees) it gets nothing: he runs where the head looks and faces it. The player's own ZL is kept.
-void vr_pad(uint64_t *buttons, int32_t lx, int32_t ly) {
+// forward (within 45 degrees) he runs where the head looks, unless the head is within NX2NAVI_VR_RUN_ZONE degrees of
+// its rest (the game's own camera's way, which the head turns from): then straight that way, so a head held about
+// forward never steers him. The stick is turned so the game, which moves him relative to the head's view, runs him
+// so, and turn_link faces him that way. The player's own ZL is kept.
+static double head_s, head_c = 1;   // the head's view's level direction (sin, cos of its yaw), from the last camera update
+static double base_s, base_c = 1;   // the game's own camera's, before the head turned it
+static double run_s, run_c = 1;     // the way a run straight ahead takes
+static uint64_t run_at;             // when the stick last ran him straight ahead (plat_now_ns)
+
+void vr_pad(uint64_t *buttons, int32_t *lx, int32_t *ly) {
     if (plat_now_ns() - fp_at > 200000000ull) return;
-    const int64_t m2 = (int64_t)lx * lx + (int64_t)ly * ly;
+    const int64_t m2 = (int64_t)*lx * *lx + (int64_t)*ly * *ly;
     if (m2 < (int64_t)8000 * 8000) return;
-    if (ly > 0 && 2 * (int64_t)ly * ly >= m2) return;
-    *buttons |= 1u << 8;   // ZL
+    if (!(*ly > 0 && 2 * (int64_t)*ly * *ly >= m2)) {
+        *buttons |= 1u << 8;   // ZL
+        return;
+    }
+    const double zone = cfg_int("NX2NAVI_VR_RUN_ZONE") * M_PI / 180.0;
+    const double off = atan2(head_s * base_c - head_c * base_s, head_c * base_c + head_s * base_s);
+    if (!(fabs(off) < zone)) return;
+    // the stick's way from the rest's forward (s, c) and right (-c, s), then given relative to the head's
+    const double wx = base_s * *ly - base_c * *lx, wz = base_c * *ly + base_s * *lx;
+    const double f = wx * head_s + wz * head_c, r = -wx * head_c + wz * head_s;
+    *ly = (int32_t)fmax(-32767, fmin(32767, f));
+    *lx = (int32_t)fmax(-32767, fmin(32767, r));
+    const double n = sqrt(wx * wx + wz * wz);
+    run_s = wx / n, run_c = wz / n, run_at = plat_now_ns();
 }
 
 static void turn_link(const double ahead[3]) {
@@ -171,7 +191,10 @@ static void turn_link(const double ahead[3]) {
     if (!actor || strcmp(cfg_value("NX2NAVI_VR_CAMERA"), "first")) return;
     const double n = sqrt(ahead[0] * ahead[0] + ahead[2] * ahead[2]);
     if (!(n > 1e-4)) return;
-    const float s = (float)(ahead[0] / n), c = (float)(ahead[2] / n);
+    head_s = ahead[0] / n, head_c = ahead[2] / n;
+    const int straight = plat_now_ns() - run_at < 100000000ull;   // running straight ahead: that way
+    const float s = (float)(straight ? run_s : head_s), c = (float)(straight ? run_c : head_c);
+
     uint64_t components = 0, c0 = 0, facing = 0;
     memcpy(&components, (const void *)(uintptr_t)(actor + 0x270), 8);
     if (game_rw(components, 8)) memcpy(&c0, (const void *)(uintptr_t)components, 8);
@@ -208,6 +231,10 @@ void vr_camera_update(Cpu *c, int scene) {
     }
     memcpy(in_pos[k], pos, sizeof pos), memcpy(in_at[k], at, sizeof at), memcpy(in_up[k], up, sizeof up);
     have_out[k] = 0;
+    if (scene == 1) {   // the game's own camera's level way: the head's rest, for a run straight ahead
+        const double fx = at[0] - pos[0], fz = at[2] - pos[2], n = sqrt(fx * fx + fz * fz);
+        if (n > 1e-6) base_s = fx / n, base_c = fz / n;
+    }
     double eye[3];
     if (scene == 1 && vk_xr_head_active() && first_person_eye(eye))   // the game's camera's direction kept, from his eyes
         for (int i = 0; i < 3; i++) at[i] += eye[i] - pos[i], pos[i] = eye[i];

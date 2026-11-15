@@ -1826,6 +1826,7 @@ static void tab_vr(float scale) {
     }
     opt_slider("NX2NAVI_VR_SWING_SPEED", UI_MENU_VR_SWING_SPEED, 100, 500, UI_MENU_VR_SWING_SPEED_DESC, 10, "%.0f cm/s");
     opt_slider("NX2NAVI_VR_CHARGE_REACH", UI_MENU_VR_CHARGE_REACH, 25, 70, UI_MENU_VR_CHARGE_REACH_DESC, 1, "%.0f cm");
+    opt_slider("NX2NAVI_VR_RUN_ZONE", UI_MENU_VR_RUN_ZONE, 0, 20, UI_MENU_VR_RUN_ZONE_DESC, 1, "%.0f degrees");
     opt_group(UI_MENU_VR_GROUP_HUD);
     static const UiTextId huds[] = {UI_MENU_VR_HUD_PANEL, UI_MENU_VR_HUD_PICTURE};
     opt_choice("NX2NAVI_VR_HUD", UI_MENU_VR_HUD, huds, 2, UI_MENU_VR_HUD_DESC);
