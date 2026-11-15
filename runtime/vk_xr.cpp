@@ -157,6 +157,7 @@ struct Xr {
     VkImageView depth_view = VK_NULL_HANDLE;
     uint32_t depth_w = 0, depth_h = 0;
     uint64_t depth_kept = 0;
+    VkBuffer rows = VK_NULL_HANDLE;   // each depth row's least then greatest depth (shaders/xr_depth_keep.comp)
     VkDescriptorSetLayout keep_set = VK_NULL_HANDLE;
     VkPipelineLayout keep_layout = VK_NULL_HANDLE;
     VkPipeline keep_pipe = VK_NULL_HANDLE;
@@ -400,6 +401,37 @@ bool make_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage
     return vkCreateImageView(x.device, &vc, nullptr, &view) == VK_SUCCESS;
 }
 
+// A device-local buffer of n bytes
+bool make_buffer(VkDeviceSize n, VkBufferUsageFlags usage, VkBuffer &buf) {
+    Xr &x = xr();
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = n, bi.usage = usage;
+    if (vkCreateBuffer(x.device, &bi, nullptr, &buf) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(x.device, buf, &mr);
+    VkPhysicalDeviceMemoryProperties mem;
+    vkGetPhysicalDeviceMemoryProperties(x.phys, &mem);
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < mem.memoryTypeCount && type == UINT32_MAX; i++)
+        if ((mr.memoryTypeBits & (1u << i)) && (mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) type = i;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size, ai.memoryTypeIndex = type;
+    VkDeviceMemory dm = VK_NULL_HANDLE;
+    return type != UINT32_MAX && vkAllocateMemory(x.device, &ai, nullptr, &dm) == VK_SUCCESS &&
+           vkBindBufferMemory(x.device, buf, dm, 0) == VK_SUCCESS;
+}
+
+// A barrier on all memory: what came before is done and visible to what comes after
+void memory_barrier(VkCommandBuffer cb) {
+    VkMemoryBarrier2 m{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    m.srcStageMask = m.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    m.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    m.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.memoryBarrierCount = 1, d.pMemoryBarriers = &m;
+    vkCmdPipelineBarrier2(cb, &d);
+}
+
 // The HUD panel's shader (shaders/xr_hud.comp): two sampled float images in, two RGBA8 storage images out, push descriptors
 bool make_hud_pipeline() {
     Xr &x = xr();
@@ -496,11 +528,12 @@ bool make_depth_pipeline() {
     si.magFilter = si.minFilter = VK_FILTER_LINEAR;
     si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     if (vkCreateSampler(x.device, &si, nullptr, &x.linear) != VK_SUCCESS) return false;
-    const VkDescriptorSetLayoutBinding b[3] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+    const VkDescriptorSetLayoutBinding b[4] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
                                                {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-                                               {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+                                               {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                               {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 3, li.pBindings = b;
+    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 4, li.pBindings = b;
     if (vkCreateDescriptorSetLayout(x.device, &li, nullptr, &x.depth_set) != VK_SUCCESS) return false;
     const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(float) * 7};
     VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -528,10 +561,11 @@ bool make_keep_pipeline() {
     si.magFilter = si.minFilter = VK_FILTER_NEAREST;
     si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     if (vkCreateSampler(x.device, &si, nullptr, &x.keep_sampler) != VK_SUCCESS) return false;
-    const VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-                                               {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+    const VkDescriptorSetLayoutBinding b[3] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                               {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                               {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 2, li.pBindings = b;
+    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 3, li.pBindings = b;
     if (vkCreateDescriptorSetLayout(x.device, &li, nullptr, &x.keep_set) != VK_SUCCESS) return false;
     const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(int32_t) * 2};
     VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -587,13 +621,16 @@ bool make_eyes(VkCommandBuffer cb, const Drawn &d) {
         const VkDescriptorImageInfo info[3] = {{x.linear, x.scene8_view, VK_IMAGE_LAYOUT_GENERAL},
                                                {x.nearest, x.depth_view, VK_IMAGE_LAYOUT_GENERAL},
                                                {VK_NULL_HANDLE, x.eye8_view[e], VK_IMAGE_LAYOUT_GENERAL}};
-        VkWriteDescriptorSet w[3]{};
-        for (uint32_t i = 0; i < 3; i++) {
+        const VkDescriptorBufferInfo rows{x.rows, 0, 8ull * x.depth_h};
+        VkWriteDescriptorSet w[4]{};
+        for (uint32_t i = 0; i < 4; i++) {
             w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, w[i].dstBinding = i, w[i].descriptorCount = 1;
-            w[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            w[i].pImageInfo = &info[i];
+            w[i].descriptorType = i == 3 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                                  : i < 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            if (i == 3) w[i].pBufferInfo = &rows;
+            else w[i].pImageInfo = &info[i];
         }
-        x.push_set(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.depth_layout, 0, 3, w);
+        x.push_set(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.depth_layout, 0, 4, w);
         const float side = (e ? 0.5f : -0.5f) * d.ipd * strength;   // the left eye to the left: the scene moves right in it
         // the largest move, at most a quarter of the picture: the shader scans no further
         const float most = std::min(0.25f, 0.5f * std::fabs(side / tan_x) * near_inv + 0.002f);
@@ -1066,7 +1103,9 @@ extern "C" void vk_xr_keep_depth(VkCommandBuffer cb, VkImageView depth, uint32_t
     bool fresh = false;
     if (!x.depth || x.depth_w != w || x.depth_h != h) {
         x.depth = VK_NULL_HANDLE, x.depth_kept = 0;   // (another size's is left behind, as the scene's)
-        if (!make_image(w, h, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, x.depth, x.depth_view)) {
+        x.rows = VK_NULL_HANDLE;
+        if (!make_image(w, h, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, x.depth, x.depth_view) ||
+            !make_buffer(8ull * h, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, x.rows)) {
             rt_log("vr: the depth stereo's depth image %ux%u could not be made: one picture to both eyes", w, h);
             x.keep_pipe = VK_NULL_HANDLE;
             return;
@@ -1075,20 +1114,26 @@ extern "C" void vk_xr_keep_depth(VkCommandBuffer cb, VkImageView depth, uint32_t
         rt_log("vr: depth stereo keeps the scene's depth: %ux%u", w, h);
     }
     barrier(cb, x.depth, fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    vkCmdFillBuffer(cb, x.rows, 0, 4ull * h, 0x7f800000u);   // each row's least: +inf
+    vkCmdFillBuffer(cb, x.rows, 4ull * h, 4ull * h, 0);      // its greatest: 0
+    memory_barrier(cb);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.keep_pipe);
     const VkDescriptorImageInfo info[2] = {{x.keep_sampler, depth, VK_IMAGE_LAYOUT_GENERAL},
                                            {VK_NULL_HANDLE, x.depth_view, VK_IMAGE_LAYOUT_GENERAL}};
-    VkWriteDescriptorSet wr[2]{};
-    for (uint32_t i = 0; i < 2; i++) {
+    const VkDescriptorBufferInfo rows{x.rows, 0, 8ull * h};
+    VkWriteDescriptorSet wr[3]{};
+    for (uint32_t i = 0; i < 3; i++) {
         wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, wr[i].dstBinding = i, wr[i].descriptorCount = 1;
-        wr[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        wr[i].pImageInfo = &info[i];
+        wr[i].descriptorType = i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                               : i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        if (i == 2) wr[i].pBufferInfo = &rows;
+        else wr[i].pImageInfo = &info[i];
     }
-    x.keep_push(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.keep_layout, 0, 2, wr);
+    x.keep_push(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.keep_layout, 0, 3, wr);
     const int32_t pc[2] = {(int32_t)w, (int32_t)h};
     vkCmdPushConstants(cb, x.keep_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
     vkCmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);
-    barrier(cb, x.depth, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    memory_barrier(cb);
     x.depth_kept++;
 }
 
