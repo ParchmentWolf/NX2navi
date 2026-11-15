@@ -1812,6 +1812,7 @@ static void tab_vr(float scale) {
     opt_slider("NX2NAVI_VR_EYE_UP", UI_MENU_VR_EYE_UP, -30, 30, UI_MENU_VR_EYE_UP_DESC, 1, "%+.0f cm");
     opt_slider("NX2NAVI_VR_EYE_SIDE", UI_MENU_VR_EYE_SIDE, -30, 30, UI_MENU_VR_EYE_SIDE_DESC, 1, "%+.0f cm");
     opt_slider("NX2NAVI_VR_EYE_FORWARD", UI_MENU_VR_EYE_FORWARD, -30, 30, UI_MENU_VR_EYE_FORWARD_DESC, 1, "%+.0f cm");
+    opt_slider("NX2NAVI_VR_EVENT_UP", UI_MENU_VR_EVENT_UP, -50, 50, UI_MENU_VR_EVENT_UP_DESC, 1, "%+.0f cm");
     opt_group(UI_MENU_VR_GROUP_CONTROLS);
     {   // the description of the scheme chosen: its buttons
         static const UiTextId schemes[] = {UI_MENU_VR_CONTROLS_PAD, UI_MENU_VR_CONTROLS_META};

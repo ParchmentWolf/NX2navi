@@ -211,6 +211,12 @@ void vr_camera_update(Cpu *c, int scene) {
     double eye[3];
     if (scene == 1 && vk_xr_head_active() && first_person_eye(eye))   // the game's camera's direction kept, from his eyes
         for (int i = 0; i < 3; i++) at[i] += eye[i] - pos[i], pos[i] = eye[i];
+    if (scene == 2) {   // an event's camera raised by Link's height for his age, and NX2NAVI_VR_EVENT_UP cm more
+        int child = 1;
+        dbg_flag_get("Sequence_IsChildhood", &child);
+        const double lift = (child ? 1.27 : 1.80) + cfg_int("NX2NAVI_VR_EVENT_UP") / 100.0;
+        pos[1] += lift, at[1] += lift;
+    }
     if (!vk_xr_camera(pos, at, up)) return;
     for (int i = 0; i < 3; i++) set_d(c, i, pos[i]), set_d(c, 3 + i, at[i]), set_s(c, up_reg[i], up[i]);
     memcpy(out_pos[k], pos, sizeof pos), memcpy(out_at[k], at, sizeof at), have_out[k] = 1;

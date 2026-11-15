@@ -93,6 +93,9 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_VR_CHARGE_REACH] = "Charge reach",
     [UI_MENU_VR_CHARGE_REACH_DESC] = "How far out from your body a swing must leave your hand to keep charging the sword "
         "(Meta/Oculus); bringing the hand back in releases it. Lower suits shorter arms.",
+    [UI_MENU_VR_EVENT_UP] = "Cutscene height",
+    [UI_MENU_VR_EVENT_UP_DESC] = "Moves your eyes up or down in cutscenes and conversations, in centimetres. They stand "
+        "Link's height (a child's or an adult's) above the game's camera.",
     [UI_MENU_VR_SCALE] = "Field of view",
     [UI_MENU_VR_SCALE_DESC] = "How much of the world the view takes in. The default, 100%, matches the headset's lenses exactly. "
         "Higher fits more of the world into your view, so everything looks smaller; lower zooms in. Away from 100%, "
