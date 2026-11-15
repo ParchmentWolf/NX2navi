@@ -27,9 +27,10 @@ typedef struct {
     int parts;
     float lo[3], hi[3];
     float grip_z;   // a sword's (blade along +z): where the hand holds it, 5 cm behind the crossguard (further on a long handle)
+    float head_z;   // along +z from the end at -z: where the shape first widens (a hammer's head), the far end if never
 } VrModel;
 
-// Model/<actor>.<actor>.bfres.zs's shapes at their finest detail and their materials' "_Alb" textures; 1 when read
+// Model/<actor>.<actor>.bfres.zs's (or, for "<actor>.<model>", Model/<actor>.<model>.bfres.zs's) shapes at their finest detail and their materials' "_Alb" textures; 1 when read
 int vr_model_load(const char *actor, VrModel *out);
 void vr_model_free(VrModel *m);
 

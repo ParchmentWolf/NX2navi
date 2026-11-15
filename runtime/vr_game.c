@@ -141,18 +141,18 @@ static int link_aims(void) {
 // gameplay camera updated a moment ago (not the title, a load, an event), Link there and not in one of his scripted
 // Demo states (the ocarina among them), and the game not paused by its menus (its three pause steps' flags). An item
 // wheel's slot is equipped (its era's AssignableItem enum) a few reads after the release, once the quick select closed.
+static int hand_item(char out[96]);
 void vr_tick(Cpu *c) {
     char state[48];
     link_state(state);
     vk_xr_ocarina(!strncmp(state, "DemoOcarina", 11));   // playing the ocarina (a lesson's too)
-    char weapon[48];   // his upper body with a weapon out: "CommonUpper" ("" once put away)
-    link_state_at(weapon, 0x31c);
-    vk_xr_weapon_out(weapon[0] && strcmp(weapon, "WeaponEquipOffUpper"));
-    {   // the sword and shield equipped (actor names), for VR's hands
-        char sword[64], shield[64];
+    {   // what he holds out (the sword and shield, or an item and the shield), for the draw gesture and VR's hands
+        char sword[64], shield[64], item[96];
         if (!dbg_text_get("PlayerStatus.EquipWeapon", sword)) sword[0] = 0;
         if (!dbg_text_get("PlayerStatus.EquipShield", shield)) shield[0] = 0;
         vk_xr_gear(sword, shield);
+        vk_xr_weapon_out(hand_item(item));
+        vk_xr_hand_item(item);
     }
     int slot;
     const int open = vk_xr_wheel(&slot) != 0;
@@ -173,6 +173,92 @@ void vr_tick(Cpu *c) {
     }
 }
 
+static uint64_t zr_at, y_at;   // the item button's (ZR) and the sword's (Y) last presses (plat_now_ns), vr_pad
+
+// Whether Link holds something out, and the item in his hand as VR's hands draw it (a model of the game's files), ""
+// for the sword. His state's names (all of component 107's, one after another) tell it: a weapon or item out
+// (CommonUpper, WeaponEquipOnUpper), aiming or throwing (the bow's and slingshot's Bow...Upper, the hookshot's and
+// boomerang's HoldItem, Hookshot..., FaceBattleBoomerang), a bottle's use, a swing; out until half a second without, or
+// at once when he puts it away (WeaponEquipOff). The item button with a hand item on it puts that item in his hand, the sword's
+// button followed by a sword's attack the sword again; aiming puts the item aimed. A bottle's model shows what it holds
+// now (its BottleItem enum).
+static int hand_item(char out[96]) {
+    out[0] = 0;
+    char names[512] = " ";
+    const uint64_t actor = dbg_player_actor();
+    uint64_t components = 0, c107 = 0;
+    if (actor && game_rw(actor + 0x270, 8)) memcpy(&components, (const void *)(uintptr_t)(actor + 0x270), 8);
+    if (components && game_rw(components + 107 * 8, 8)) memcpy(&c107, (const void *)(uintptr_t)(components + 107 * 8), 8);
+    if (c107 && game_rw(c107 + 0x200, 0x300)) {   // all of component 107's names, one after another
+        const char *b = (const char *)(uintptr_t)(c107 + 0x200);
+        size_t len = 1;
+        for (int o = 0; o < 0x300; o++) {
+            if (b[o] < 'A' || b[o] > 'Z' || (o && b[o - 1])) continue;
+            int n = 0;
+            while (o + n < 0x300 && b[o + n] > 32 && b[o + n] < 127) n++;
+            if (n >= 4 && o + n < 0x300 && !b[o + n] && len + n + 2 < sizeof names)
+                memcpy(names + len, b + o, n), len += n, names[len++] = ' ', names[len] = 0;
+        }
+    }
+    int child = 1;
+    uint32_t item = 0;
+    dbg_flag_get("Sequence_IsChildhood", &child);
+    dbg_enum_get(child ? "PlayerStatus.AssignableItem.Child" : "PlayerStatus.AssignableItem.Adult", &item);
+    // the hand items by their AssignableItem value; a bottle 'A'..'E' by its slot
+    static const struct { const char *value, *model; } items[] = {
+        {"SlingShot", "Weapon_Range_SlingShot"}, {"Bow", "Weapon_Range_Bow"}, {"Hookshot", "Item_Hookshot.Item_Hookshot_Body"},
+        {"Longshot", "Item_Hookshot.Item_Hookshot_Body"}, {"Boomerang", "Item_Boomerang"}, {"Hammer", "Item_Hammer"},
+        {"DekuStick", "Item_DekuStick"}, {"BottleA", "A"}, {"BottleB", "B"}, {"BottleC", "C"}, {"BottleD", "D"},
+        {"BottleE", "E"}};
+    const char *now_item = NULL;
+    for (size_t i = 0; i < sizeof items / sizeof *items && !now_item; i++)
+        if (item == dbg_name_hash(items[i].value)) now_item = items[i].model;
+    static const char *held;          // what the last button put in his hand (NULL the sword)
+    static uint64_t seen_zr, seen_y;
+    if (zr_at != seen_zr) {
+        seen_zr = zr_at;
+        if (now_item) held = now_item;
+    }
+    // the sword's button takes the sword back only when a sword's attack follows (the game ignores it with a bottle out,
+    // and the sword hand's swing taps it); the hammer's own swing puts the hammer back
+    const uint64_t t0 = plat_now_ns();
+    if (y_at != seen_y && t0 - y_at < 400000000ull && (strstr(names, " Cut") || strstr(names, " Charge")) &&
+        !strstr(names, "Hammer") && t0 - zr_at > 400000000ull)
+        seen_y = y_at, held = NULL;
+    if (strstr(names, "Hammer") && now_item && !strcmp(now_item, "Item_Hammer")) held = now_item;
+    const int aiming = (strstr(names, " BowReLoadUpper ") || strstr(names, " BowChargeUpper ") ||
+                        strstr(names, " BowShootUpper ") || strstr(names, " HoldItem") || strstr(names, " Hookshot") ||
+                        strstr(names, " FaceBattleBoomerang ")) && now_item;
+    if (aiming) held = now_item;
+    static uint64_t out_at;
+    const uint64_t t = plat_now_ns();
+    if (aiming || strstr(names, " CommonUpper ") || strstr(names, " WeaponEquipOnUpper ") || strstr(names, "Bottle") ||
+        strstr(names, "Drink") || strstr(names, " Cut") || strstr(names, " DemoShield") || strstr(names, "Hammer"))
+        out_at = t;
+    // put away: at once when he puts it away, else after two seconds with nothing out (what the button took stays
+    // meanwhile: the item comes out a moment after the press, and a swing's end shows none of those names)
+    const int away = strstr(names, " WeaponEquipOff") != NULL;
+    if (away || t - out_at > 2000000000ull) held = NULL;
+    if (away || t - out_at > 500000000ull) return 0;
+    if (!held) return 1;
+    if (held[1]) {
+        snprintf(out, 96, "%s", held);
+        return 1;
+    }
+    static const struct { const char *value, *model; } bottles[] = {
+        {"RedPotion", "Item_Bottle_RedPotion"}, {"Fish", "Item_Bottle_Fish"}, {"Letter", "Item_Bottle_Letter"},
+        {"BigPoe", "Item_Bottle_Poe"}, {"Poe", "Item_Bottle_Poe"}, {"Bug", "Item_Bottle_Bug"},
+        {"Fairy", "Item_Bottle_Fairy"}, {"MaxMilk", "Item_Bottle_Milk"}, {"HalfMilk", "Item_Bottle_HalfMilk"}};
+    char key[96];
+    uint32_t what = 0;
+    snprintf(key, sizeof key, "PlayerStatus.AssignableItem.BottleInfo.Bottle%c.BottleItem", held[0]);
+    dbg_enum_get(key, &what);
+    snprintf(out, 96, "Item_Bottle");   // empty, or what has no model of its own (the potions' other colours, fire)
+    for (size_t i = 0; i < sizeof bottles / sizeof *bottles; i++)
+        if (what == dbg_name_hash(bottles[i].value)) snprintf(out, 96, "%s", bottles[i].model);
+    return 1;
+}
+
 // ov_input.c npad_states: in first person play, while the left stick is pushed sideways or back the game gets ZL held,
 // so Link strafes as Z-targeting does, facing the way he faced (the head's, from running forward or standing). Pushed
 // forward (within 45 degrees) he runs where the head looks, unless the head is within NX2NAVI_VR_RUN_ZONE degrees of
@@ -185,6 +271,13 @@ static double run_s, run_c = 1;     // the way a run straight ahead takes
 static uint64_t run_at;             // when the stick last ran him straight ahead (plat_now_ns)
 
 void vr_pad(uint64_t *buttons, int32_t *lx, int32_t *ly) {
+    {   // the item button's and the sword's presses, for the item in hand (hand_item)
+        static int zr_was, y_was;
+        const int zr = (int)(*buttons >> 9 & 1), y = (int)(*buttons >> 3 & 1);
+        if (zr && !zr_was) zr_at = plat_now_ns();
+        if (y && !y_was) y_at = plat_now_ns();
+        zr_was = zr, y_was = y;
+    }
     if (plat_now_ns() - fp_at > 200000000ull) return;
     const int64_t m2 = (int64_t)*lx * *lx + (int64_t)*ly * *ly;
     if (m2 < (int64_t)8000 * 8000) return;

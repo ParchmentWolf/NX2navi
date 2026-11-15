@@ -189,7 +189,7 @@ struct Xr {
     // (shaders/xr_hand_vs.vert, xr_hand_fs.frag) and put into scene8 and the kept depth (xr_hand_mix.comp)
     // each model read once, by its actor's name: state 1 reading (cpu the model worker's until then), 2 read, 3 none
     struct HandItem {
-        char name[64] = "";
+        char name[96] = "";
         std::atomic<int> state{0};
         VrModel cpu{};
         VkBuffer vb = VK_NULL_HANDLE, ib = VK_NULL_HANDLE, staging[VR_MODEL_PARTS]{};
@@ -198,7 +198,7 @@ struct Xr {
         bool uploaded = false;
     } items[16];
     std::mutex gear_mu;
-    char gear[2][64]{};   // vr_game.c vk_xr_gear: the sword and the shield equipped
+    char gear[3][96]{};   // vr_game.c: the sword and the shield equipped (vk_xr_gear), the item used (vk_xr_hand_item)
     VkDescriptorSetLayout hand_set = VK_NULL_HANDLE, mix_set = VK_NULL_HANDLE;
     VkPipelineLayout hand_layout = VK_NULL_HANDLE, mix_layout = VK_NULL_HANDLE;
     VkPipeline hand_pipe = VK_NULL_HANDLE, mix_pipe = VK_NULL_HANDLE;
@@ -980,9 +980,22 @@ Mat4 inverse_rigid(const Mat4 &a) {
 }
 // The model held in the grip (OpenXR's grip, held pointing forward: -z forward through the fist from the little finger
 // to the thumb, x to the right, y up, on either hand): its axes and where its origin sits, in the grip
-Mat4 held(int item, int right_hand, const VrModel &m) {
+Mat4 held(int item, int right_hand, const VrModel &m, const char *name) {
     Mat4 r{};
     r.m[15] = 1;
+    if (item == 2 && strstr(name, "Hookshot")) {   // the hookshot: pointing out of the fist forward
+        r.m[1] = 1;                 // model x -> grip y
+        r.m[6] = 1;                 // model y -> grip z
+        r.m[8] = 1;                 // model z -> grip x
+        return r;
+    }
+    if (item == 2) {   // the other items as a sword: along the fist (+z), held near the handle's end or at the middle
+        r.m[1] = 1, r.m[4] = 1, r.m[10] = -1;
+        if (strstr(name, "Hammer")) r.m[14] = 0.5f * (m.lo[2] + m.head_z);   // the handle's middle
+        else if (strstr(name, "DekuStick")) r.m[14] = m.lo[2] + 0.11f;
+        else if (strstr(name, "SlingShot")) r.m[14] = m.lo[2] + 0.06f;
+        return r;
+    }
     if (item == 0) {   // the sword: the blade (+z) along the fist, its flat (y) across the palm, the grip held
         r.m[1] = 1;                 // model x -> grip y
         r.m[4] = 1;                 // model y -> grip x
@@ -1010,14 +1023,16 @@ void make_hands(VkCommandBuffer cb, const Drawn &d) {
     Xr &x = xr();
     float planes[2];
     if (!d.tracked || strcmp(cfg_value("NX2NAVI_VR_PLAY"), "motion") || strcmp(cfg_value("NX2NAVI_VR_CONTROLS"), "meta") ||
-        !x.weapon_out.load() || !x.depth_kept || !vk_dlaa_vr_planes(planes))
+        !x.depth_kept || !vk_dlaa_vr_planes(planes))
         return;
-    Xr::HandItem *gear[2];
+    // the item in Link's hand in the sword's place, with the shield; else the sword and shield while they are out
+    Xr::HandItem *gear[3] = {};
     {
         std::lock_guard<std::mutex> lk(x.gear_mu);
-        gear[0] = hand_item(x.gear[0]), gear[1] = hand_item(x.gear[1]);
+        if (x.gear[2][0]) gear[2] = hand_item(x.gear[2]), gear[1] = hand_item(x.gear[1]);
+        else if (x.weapon_out.load()) gear[0] = hand_item(x.gear[0]), gear[1] = hand_item(x.gear[1]);
     }
-    if (!gear[0] && !gear[1]) return;
+    if (!gear[0] && !gear[1] && !gear[2]) return;
     if (!x.hand_tried) {
         x.hand_tried = true;
         if (!make_hand_pipelines()) {
@@ -1077,13 +1092,16 @@ void make_hands(VkCommandBuffer cb, const Drawn &d) {
     vkCmdSetViewport(cb, 0, 1, &vp), vkCmdSetScissor(cb, 0, 1, &sc);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, x.hand_pipe);
     // a sword held in both hands (the Biggoron Sword) leaves no shield out
-    const bool two_handed = gear[0] && strstr(gear[0]->name, "Biggoron") != nullptr;
-    for (int i = 0; i < 2; i++) {
+    // held in both hands (the Biggoron Sword, the bow, the slingshot, the hammer, a Deku Stick): no shield
+    const bool two_handed = (gear[0] && strstr(gear[0]->name, "Biggoron")) ||
+                            (gear[2] && (strstr(gear[2]->name, "_Bow") || strstr(gear[2]->name, "SlingShot") ||
+                                         strstr(gear[2]->name, "Hammer") || strstr(gear[2]->name, "DekuStick")));
+    for (int i = 0; i < 3; i++) {
         if (!gear[i] || (i == 1 && two_handed)) continue;
         const Xr::HandItem &it = *gear[i];
-        const int hand = i == 0 ? sword : 1 - sword;
+        const int hand = i == 1 ? 1 - sword : sword;
         if (!it.uploaded || !ok[hand]) continue;
-        const Mat4 mv = mul(view, mul(pose_matrix(grips[hand]), held(i, hand == 1, it.cpu)));
+        const Mat4 mv = mul(view, mul(pose_matrix(grips[hand]), held(i, hand == 1, it.cpu, it.name)));
         const Mat4 clip = mul(proj, mv);
         float pc[32];
         std::memcpy(pc, clip.m, sizeof clip.m), std::memcpy(pc + 16, mv.m, sizeof mv.m);
@@ -2115,6 +2133,12 @@ extern "C" void vk_xr_wheel_allow(int allow) { xr().wheel_allowed.store(allow !=
 extern "C" void vk_xr_ocarina(int on) { xr().ocarina.store(on != 0); }
 
 extern "C" void vk_xr_weapon_out(int out) { xr().weapon_out.store(out != 0); }
+
+extern "C" void vk_xr_hand_item(const char *model) {
+    Xr &x = xr();
+    std::lock_guard<std::mutex> lk(x.gear_mu);
+    std::snprintf(x.gear[2], sizeof x.gear[2], "%s", model);
+}
 
 extern "C" void vk_xr_gear(const char *sword, const char *shield) {
     Xr &x = xr();

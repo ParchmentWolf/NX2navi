@@ -10,6 +10,11 @@
 // bits), count (+0x2c) and first vertex (+0x30). The model's materials (FMAT, 0xb0 bytes, from +0x38) name their
 // textures (+0x20, strings' offsets; +0xa2 their count). Strings are a 16-bit length and the bytes. Textures are
 // apart, Tex/<name>.bntx.zs, the name whole (a variant's ".00" kept).
+// The skeleton (FSKL, the model's +0x18) holds its bones (+0x10, 0x58 bytes each: +0x22 the parent, +0x2c flags, +0x30
+// scale, +0x3c rotation, Euler angles XYZ by the flags' 0x1000 or else a quaternion, +0x4c translation), its matrices'
+// bones (+0x18, u16 each) and its bone count (+0x38). A shape whose vertices name no bone (+0x5a, 0) sits in its own
+// bone's place (+0x54); one bone each (_i0, a matrix's index), in that bone's; two or more already in the model's. The
+// skeleton's rest pose puts them together as the game shows the model before it animates it.
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,11 +65,13 @@ static int attr(const uint8_t *p, uint32_t fmt, float out[3]) {
     }
 }
 
-// the material's colour texture's name (its texture ending "_Alb", or "_Alb.NN", a variant) into name; 0 when none
+// the material's colour texture's name (its texture ending "_Alb", or "_Alb.NN", a variant; without one, its glow's,
+// "_Emc", as a boomerang's gem has) into name; 0 when none
 static int albedo_of(const uint8_t *b, size_t n, uint64_t mat, char *name, size_t cap) {
     if (mat + 0xb0 > n || memcmp(b + mat, "FMAT", 4)) return 0;
     const uint64_t list = le64(b + mat + 0x20);
     const uint8_t count = b[mat + 0xa2];
+    for (int pass = 0; pass < 2; pass++)
     for (uint8_t i = 0; i < count && list + 8ull * (i + 1) <= n; i++) {
         const uint64_t so = le64(b + list + 8ull * i);
         if (so + 2 > n) continue;
@@ -73,7 +80,7 @@ static int albedo_of(const uint8_t *b, size_t n, uint64_t mat, char *name, size_
         memcpy(name, b + so + 2, len), name[len] = 0;
         const char *dot = strchr(name, '.');
         const size_t stem = dot ? (size_t)(dot - name) : len;
-        if (stem > 4 && !memcmp(name + stem - 4, "_Alb", 4)) return 1;
+        if (stem > 4 && !memcmp(name + stem - 4, pass ? "_Emc" : "_Alb", 4)) return 1;
     }
     return 0;
 }
@@ -106,6 +113,50 @@ static void part_texture(const uint8_t *b, size_t n, uint64_t mat, const char *a
     if (p->rgba) memcpy(p->rgba, c, 4);
 }
 
+// the bones' places in the model at rest (3x4 by rows), from the skeleton's; their count, 0 without a skeleton
+enum { MAX_BONES = 256 };
+static int bones_at_rest(const uint8_t *b, size_t n, uint64_t model, float world[][12]) {
+    const uint64_t sk = le64(b + model + 0x18);
+    if (sk + 0x40 > n || memcmp(b + sk, "FSKL", 4)) return 0;
+    const uint64_t bones = le64(b + sk + 0x10);
+    int count = le16(b + sk + 0x38);
+    if (count > MAX_BONES) count = MAX_BONES;
+    for (int i = 0; i < count; i++) {
+        const uint64_t o = bones + 0x58ull * i;
+        if (o + 0x58 > n) return i;
+        float f[10], r[9], local[12];
+        memcpy(f, b + o + 0x30, 40);
+        const float *sc = f, *ro = f + 3, *tr = f + 7;
+        if (le32(b + o + 0x2c) & 0x1000) {   // Euler angles, X then Y then Z: Rz * Ry * Rx
+            const float cx = cosf(ro[0]), sx = sinf(ro[0]), cy = cosf(ro[1]), sy = sinf(ro[1]), cz = cosf(ro[2]), sz = sinf(ro[2]);
+            const float m[9] = {cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx,
+                                sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx,
+                                -sy, cy * sx, cy * cx};
+            memcpy(r, m, sizeof r);
+        } else {   // a quaternion x, y, z, w
+            const float x = ro[0], y = ro[1], z = ro[2], w = ro[3];
+            const float m[9] = {1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
+                                2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
+                                2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)};
+            memcpy(r, m, sizeof r);
+        }
+        for (int row = 0; row < 3; row++) {
+            for (int c = 0; c < 3; c++) local[4 * row + c] = r[3 * row + c] * sc[c];
+            local[4 * row + 3] = tr[row];
+        }
+        const int parent = (int16_t)le16(b + o + 0x22);
+        if (parent < 0 || parent >= i) {
+            memcpy(world[i], local, sizeof local);
+            continue;
+        }
+        for (int row = 0; row < 3; row++)
+            for (int c = 0; c < 4; c++)
+                world[i][4 * row + c] = world[parent][4 * row] * local[c] + world[parent][4 * row + 1] * local[4 + c] +
+                                        world[parent][4 * row + 2] * local[8 + c] + (c == 3 ? world[parent][4 * row + 3] : 0);
+    }
+    return count;
+}
+
 void vr_model_free(VrModel *m) {
     free(m->verts), free(m->index);
     for (int i = 0; i < m->parts; i++) free(m->part[i].rgba);
@@ -115,7 +166,8 @@ void vr_model_free(VrModel *m) {
 int vr_model_load(const char *actor, VrModel *out) {
     memset(out, 0, sizeof *out);
     char path[160];
-    snprintf(path, sizeof path, "Model/%s.%s.bfres.zs", actor, actor);
+    if (strchr(actor, '.')) snprintf(path, sizeof path, "Model/%s.bfres.zs", actor);   // "<actor>.<model>"
+    else snprintf(path, sizeof path, "Model/%s.%s.bfres.zs", actor, actor);
     size_t n = 0;
     uint8_t *b = menu_asset_load(path, &n);
     if (!b || n < 0x100 || memcmp(b, "FRES", 4)) {
@@ -125,10 +177,14 @@ int vr_model_load(const char *actor, VrModel *out) {
     }
 #define IN(o, k) ((uint64_t)(o) + (uint64_t)(k) <= n)
     int ok = 0;
+    float (*world)[12] = NULL;
     const uint64_t pool = le64(b + 0xb0), model = le64(b + 0x28);
     if (!IN(pool, 16) || !IN(model, 0x70) || memcmp(b + model, "FMDL", 4)) goto done;
     const uint64_t buffers = le64(b + pool + 8), shapes = le64(b + model + 0x28), mats = le64(b + model + 0x38);
     const uint16_t shape_n = le16(b + model + 0x6a), mat_n = le16(b + model + 0x6c);
+    world = malloc(sizeof(float) * 12 * MAX_BONES);   // the bones at rest (models are read on workers of their own)
+    const int bone_n = world ? bones_at_rest(b, n, model, world) : 0;
+    const uint64_t sk = le64(b + model + 0x18), mat_bones = sk + 0x20 <= n ? le64(b + sk + 0x18) : 0;
     // two passes over the shapes: their sizes, then their data
     for (int pass = 0; pass < 2; pass++) {
         uint32_t nv = 0, ni = 0;
@@ -143,8 +199,13 @@ int vr_model_load(const char *actor, VrModel *out) {
             const uint32_t icount = le32(b + mesh + 0x2c), first = le32(b + mesh + 0x30);
             const uint64_t ib = buffers + le32(b + mesh + 0x20);
             if (prim != 3 || !stride || !IN(data, (uint64_t)count * stride) || !IN(ib, (uint64_t)icount * isize)) continue;
+            {   // the slingshot's seeds (shown only as it shoots) left out
+                const uint64_t sn = le64(b + s + 8);
+                if (strstr(actor, "SlingShot") && IN(sn, 10) && !memcmp(b + sn + 2, "DekuSeed", 8)) continue;
+            }
             if (pass == 1) {
-                uint32_t pos_fmt = 0, nrm_fmt = 0, uv_fmt = 0, pos_at = 0, nrm_at = 0, uv_at = 0;
+                uint32_t pos_fmt = 0, nrm_fmt = 0, uv_fmt = 0, pos_at = 0, nrm_at = 0, uv_at = 0, idx_at = UINT32_MAX;
+                const int skin = b[s + 0x5a], own_bone = le16(b + s + 0x54);
                 const uint64_t attrs = le64(b + vt + 0x08);
                 for (uint8_t a = 0; a < b[vt + 0x4c]; a++) {
                     const uint64_t at = attrs + 0x10ull * a;
@@ -156,6 +217,7 @@ int vr_model_load(const char *actor, VrModel *out) {
                     if (!memcmp(nm, "_p0", 3)) pos_fmt = f, pos_at = off;
                     else if (!memcmp(nm, "_n0", 3)) nrm_fmt = f, nrm_at = off;
                     else if (!memcmp(nm, "_u0", 3)) uv_fmt = f, uv_at = off;
+                    else if (!memcmp(nm, "_i0", 3)) idx_at = off;
                 }
                 for (uint32_t v = 0; v < count; v++) {
                     const uint8_t *src = b + data + (uint64_t)v * stride;
@@ -166,6 +228,21 @@ int vr_model_load(const char *actor, VrModel *out) {
                     }
                     if (nrm_fmt) attr(src + nrm_at, nrm_fmt, q);
                     if (uv_fmt) attr(src + uv_at, uv_fmt, u);
+                    int bone = -1;   // the bone it sits in (none: already in the model's place)
+                    if (skin == 0) bone = own_bone;
+                    else if (skin == 1 && idx_at != UINT32_MAX) {
+                        const uint64_t mb = mat_bones + 2ull * src[idx_at];
+                        if (mat_bones && mb + 2 <= n) bone = le16(b + mb);
+                    }
+                    if (bone >= 0 && bone < bone_n) {
+                        const float *w = world[bone];
+                        float pp[3], qq[3];
+                        for (int r = 0; r < 3; r++) {
+                            pp[r] = w[4 * r] * p[0] + w[4 * r + 1] * p[1] + w[4 * r + 2] * p[2] + w[4 * r + 3];
+                            qq[r] = w[4 * r] * q[0] + w[4 * r + 1] * q[1] + w[4 * r + 2] * q[2];
+                        }
+                        memcpy(p, pp, sizeof pp), memcpy(q, qq, sizeof qq);
+                    }
                     d[0] = p[0], d[1] = p[1], d[2] = p[2], d[3] = q[0], d[4] = q[1], d[5] = q[2], d[6] = u[0], d[7] = u[1];
                 }
                 for (uint32_t i = 0; i < icount; i++) {
@@ -205,6 +282,12 @@ int vr_model_load(const char *actor, VrModel *out) {
                 }
                 float grip = 0;
                 for (int i = 4; i <= 8; i++) grip = fmaxf(grip, w[i]);
+                out->head_z = out->hi[2];
+                for (int i = 9; i < SLICES; i++)
+                    if (grip > 0 && w[i] > 2.5f * grip) {
+                        out->head_z = out->lo[2] + span * i / SLICES;
+                        break;
+                    }
                 for (int i = 9; i < SLICES / 2; i++)
                     if (grip > 0 && w[i] > 2.5f * grip) {
                         const float guard = out->lo[2] + span * i / SLICES, handle = guard - out->lo[2];
@@ -221,6 +304,7 @@ int vr_model_load(const char *actor, VrModel *out) {
     if (ok) rt_log("vr: hands: %s: %u vertices, %u triangles, %d parts", actor, out->verts_n, out->index_n / 3, out->parts);
 done:
 #undef IN
+    free(world);
     free(b);
     if (!ok) vr_model_free(out);
     return ok;
