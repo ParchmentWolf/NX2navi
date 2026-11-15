@@ -113,8 +113,9 @@ static _Atomic uint64_t fp_at;   // when Link was last turned to the head in fir
 static _Atomic uint64_t play_at;   // when the gameplay camera last updated outside an event (plat_now_ns)
 static _Atomic int hooks_on;       // vr_game_start switched the camera hooks on: play_at is kept
 
-// Link's state's name (his component 107, the name at its +0x244: "Wait", "CrouchGuard"...), "" when there is none
-static void link_state(char out[48]) {
+// Link's state's name (his component 107, the name at its +0x244: "Wait", "CrouchGuard"...), or his upper body's
+// (upper: at +0x34c, "BowChargeUpper"...), "" when there is none
+static void link_state_at(char out[48], uint32_t at) {
     out[0] = 0;
     const uint64_t actor = dbg_player_actor();
     uint64_t components = 0, c107 = 0;
@@ -122,9 +123,17 @@ static void link_state(char out[48]) {
     memcpy(&components, (const void *)(uintptr_t)(actor + 0x270), 8);
     if (!game_rw(components + 107 * 8, 8)) return;
     memcpy(&c107, (const void *)(uintptr_t)(components + 107 * 8), 8);
-    if (!game_rw(c107 + 0x244, 47)) return;
-    memcpy(out, (const void *)(uintptr_t)(c107 + 0x244), 47);
+    if (!game_rw(c107 + at, 47)) return;
+    memcpy(out, (const void *)(uintptr_t)(c107 + at), 47);
     out[47] = 0;
+}
+static void link_state(char out[48]) { link_state_at(out, 0x244); }
+
+// Link aims a ranged item: his upper body in the bow's (the slingshot's too) or the hookshot's states
+static int link_aims(void) {
+    char upper[48];
+    link_state_at(upper, 0x34c);
+    return !strncmp(upper, "Bow", 3) || !strncmp(upper, "Hookshot", 8);
 }
 
 // The game's thread at each pad read: whether Link plays the ocarina (a DemoOcarina state, a lesson's too), and VR's
@@ -194,7 +203,6 @@ static void turn_link(const double ahead[3]) {
     head_s = ahead[0] / n, head_c = ahead[2] / n;
     const int straight = plat_now_ns() - run_at < 100000000ull;   // running straight ahead: that way
     const float s = (float)(straight ? run_s : head_s), c = (float)(straight ? run_c : head_c);
-
     uint64_t components = 0, c0 = 0, facing = 0;
     memcpy(&components, (const void *)(uintptr_t)(actor + 0x270), 8);
     if (game_rw(components, 8)) memcpy(&c0, (const void *)(uintptr_t)components, 8);
@@ -234,6 +242,13 @@ void vr_camera_update(Cpu *c, int scene) {
     if (scene == 1) {   // the game's own camera's level way: the head's rest, for a run straight ahead
         const double fx = at[0] - pos[0], fz = at[2] - pos[2], n = sqrt(fx * fx + fz * fz);
         if (n > 1e-6) base_s = fx / n, base_c = fz / n;
+    }
+    if (scene == 1) {   // aiming: the game's own camera's ray, where its shots go, for the head's view's reticle
+        const int aims = link_aims();
+        double d[3] = {at[0] - pos[0], at[1] - pos[1], at[2] - pos[2]};
+        const double l = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        if (l > 1e-6) d[0] /= l, d[1] /= l, d[2] /= l;
+        vk_xr_aim(aims && l > 1e-6, pos, d);
     }
     double eye[3];
     if (scene == 1 && vk_xr_head_active() && first_person_eye(eye))   // the game's camera's direction kept, from his eyes

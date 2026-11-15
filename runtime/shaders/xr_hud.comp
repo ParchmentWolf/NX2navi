@@ -12,6 +12,7 @@ layout(binding = 3, rgba8) uniform writeonly image2D panel_out;
 layout(push_constant) uniform Push {
     ivec2 size;
     int keep_hud;
+    int cut;   // the panel left clear within this many pixels of its middle (the game's reticle while Link aims), 0 none
 } p;
 
 vec3 encode(vec3 c) {
@@ -24,7 +25,8 @@ void main() {
     if (any(greaterThanEqual(at, p.size))) return;
     const vec3 h = encode(texelFetch(hud, at, 0).rgb), s = encode(texelFetch(scene, at, 0).rgb);
     const vec3 d = abs(h - s);
-    const float a = smoothstep(0.01, 0.06, max(d.r, max(d.g, d.b)));
+    float a = smoothstep(0.01, 0.06, max(d.r, max(d.g, d.b)));
+    if (p.cut > 0 && length(vec2(at) + 0.5 - vec2(p.size) * 0.5) < float(p.cut)) a = 0.0;
     imageStore(scene_out, at, vec4(p.keep_hud != 0 ? h : s, 1.0));
     imageStore(panel_out, at, vec4(h * a, a));
 }

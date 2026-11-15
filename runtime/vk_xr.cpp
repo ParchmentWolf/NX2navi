@@ -37,6 +37,7 @@ extern "C" {
 #include "vk_xr.h"
 #include "vr_game.h"
 #include "vr_wheel.h"
+#include "xr_aim_spv.h"
 #include "xr_depth_keep_spv.h"
 #include "xr_depth_spv.h"
 #include "xr_hud_spv.h"
@@ -76,6 +77,8 @@ struct Drawn {
     Lens lens;
     float scale = 1.0f;    // the lens the game drew with over the one shown (NX2NAVI_VR_VIEW_SCALE)
     float ipd = 0.064f;    // the eyes' distance, metres
+    bool aim = false;      // Link aims: the game's camera's ray (aim_o, aim_d) in the head's view (x right, y up, z back)
+    float aim_o[3]{}, aim_d[3]{};
 };
 
 // after one of VR's wheels closes, the game's HUD stays off the HUD's panel this long: the game's own quick select, held
@@ -129,6 +132,8 @@ struct Xr {
     bool frame_on = false;
     Drawn drawn;
     float render_scale = 1.0f;   // the lens the game draws with over the one shown (NX2NAVI_VR_VIEW_SCALE)
+    bool aim_on = false;         // vr_game.c vk_xr_aim: Link aims, along the game's own camera's ray (world)
+    double aim_o[3]{}, aim_d[3]{};
     std::atomic<uint32_t> camera_given{0}, lens_given{0}, tracked_pictures{0};
     // the gameplay camera's updates since the last picture, and the pictures in a row with none: a paused game (the
     // inventory) draws flat pictures while the camera stands still, and those go on the screen
@@ -176,6 +181,11 @@ struct Xr {
     VkPipeline depth_pipe = VK_NULL_HANDLE;
     VkSampler linear = VK_NULL_HANDLE;
     bool depth_tried = false;
+    // the aiming reticle (shaders/xr_aim.comp, hud_mu) drawn into scene8 where the aim lands
+    VkDescriptorSetLayout aim_set = VK_NULL_HANDLE;
+    VkPipelineLayout aim_layout = VK_NULL_HANDLE;
+    VkPipeline aim_pipe = VK_NULL_HANDLE;
+    bool aim_tried = false;
     std::atomic<uint32_t> stereo_pictures{0}, stereo_missed{0}, menu_pictures{0};
     // the hand controllers (hands_mu; the session's thread writes, the game's input reads): their buttons as the pad's
     // (input_map.h bits) and sticks, and the grips' poses in the LOCAL space
@@ -469,7 +479,7 @@ bool make_hud_pipeline() {
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 4, li.pBindings = b;
     if (vkCreateDescriptorSetLayout(x.device, &li, nullptr, &x.hud_set) != VK_SUCCESS) return false;
-    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(int32_t) * 3};
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(int32_t) * 4};
     VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pi.setLayoutCount = 1, pi.pSetLayouts = &x.hud_set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
     if (vkCreatePipelineLayout(x.device, &pi, nullptr, &x.hud_layout) != VK_SUCCESS) return false;
@@ -488,8 +498,9 @@ bool make_hud_pipeline() {
 bool hud_wanted() { return strcmp(cfg_value("NX2NAVI_VR_HUD"), "panel") == 0; }
 
 // (vk_xr_capture, hud_mu held) the scene without the HUD (with it: keep_hud) and the HUD's panel made from the target as
-// it is now and the scene kept from before the HUD; false when there is nothing new to make them from
-bool make_panel(VkCommandBuffer cb, bool keep_hud) {
+// it is now and the scene kept from before the HUD, the panel clear within `cut` pixels of its middle (the game's
+// reticle while Link aims); false when there is nothing new to make them from
+bool make_panel(VkCommandBuffer cb, bool keep_hud, int cut) {
     Xr &x = xr();
     if (!x.scene || !x.hud_target || x.kept == x.used) return false;
     if (!x.hud_tried) {
@@ -533,7 +544,7 @@ bool make_panel(VkCommandBuffer cb, bool keep_hud) {
         w[i].pImageInfo = &info[i];
     }
     x.push_set(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.hud_layout, 0, 4, w);
-    const int32_t pc[3] = {(int32_t)x.hud_w, (int32_t)x.hud_h, keep_hud ? 1 : 0};
+    const int32_t pc[4] = {(int32_t)x.hud_w, (int32_t)x.hud_h, keep_hud ? 1 : 0, cut};
     vkCmdPushConstants(cb, x.hud_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
     vkCmdDispatch(cb, (x.hud_w + 7) / 8, (x.hud_h + 7) / 8, 1);
     barrier(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
@@ -687,6 +698,62 @@ bool make_keep_pipeline() {
     const VkResult r = vkCreateComputePipelines(x.device, VK_NULL_HANDLE, 1, &ci, nullptr, &x.keep_pipe);
     vkDestroyShaderModule(x.device, m, nullptr);
     return r == VK_SUCCESS;
+}
+
+// The aiming reticle's shader (shaders/xr_aim.comp): the scene's depth sampled, scene8 read and written
+bool make_aim_pipeline() {
+    Xr &x = xr();
+    if (!x.push_set || !x.nearest) return false;
+    const VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                               {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+    VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 2, li.pBindings = b;
+    if (vkCreateDescriptorSetLayout(x.device, &li, nullptr, &x.aim_set) != VK_SUCCESS) return false;
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(float) * 12};
+    VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pi.setLayoutCount = 1, pi.pSetLayouts = &x.aim_set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
+    if (vkCreatePipelineLayout(x.device, &pi, nullptr, &x.aim_layout) != VK_SUCCESS) return false;
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = sizeof xr_aim_spv, mi.pCode = xr_aim_spv;
+    VkShaderModule m = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(x.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", nullptr};
+    ci.layout = x.aim_layout;
+    const VkResult r = vkCreateComputePipelines(x.device, VK_NULL_HANDLE, 1, &ci, nullptr, &x.aim_pipe);
+    vkDestroyShaderModule(x.device, m, nullptr);
+    return r == VK_SUCCESS;
+}
+
+// (vk_xr_capture, hud_mu held, after make_panel, before make_eyes) the reticle drawn into scene8 where the aim's ray
+// first goes behind the scene's depth, while Link aims
+void make_aim(VkCommandBuffer cb, const Drawn &d) {
+    Xr &x = xr();
+    float planes[2];
+    if (!d.aim || !x.depth_kept || !vk_dlaa_vr_planes(planes)) return;
+    if (!x.aim_tried) {
+        x.aim_tried = true;
+        if (!make_aim_pipeline()) {
+            rt_log("vr: the aiming reticle's shader could not be made");
+            x.aim_pipe = VK_NULL_HANDLE;
+        }
+    }
+    if (!x.aim_pipe) return;
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.aim_pipe);
+    const VkDescriptorImageInfo info[2] = {{x.nearest, x.depth_view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, x.scene8_view, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet w[2]{};
+    for (uint32_t i = 0; i < 2; i++) {
+        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, w[i].dstBinding = i, w[i].descriptorCount = 1;
+        w[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w[i].pImageInfo = &info[i];
+    }
+    x.push_set(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.aim_layout, 0, 2, w);
+    const float pc[12] = {(float)x.hud_w, (float)x.hud_h, d.aim_o[0], d.aim_o[1], d.aim_o[2], d.aim_d[0], d.aim_d[1],
+                          d.aim_d[2], d.lens.r * d.scale, d.lens.u * d.scale, planes[0], planes[1]};
+    vkCmdPushConstants(cb, x.aim_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    vkCmdDispatch(cb, 1, 1, 1);
+    barrier(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
 }
 
 // (vk_xr_capture, hud_mu held, after make_panel) each eye's picture from the scene make_panel left in scene8 and this
@@ -1613,6 +1680,13 @@ extern "C" void vk_xr_wheel_allow(int allow) { xr().wheel_allowed.store(allow !=
 
 extern "C" void vk_xr_ocarina(int on) { xr().ocarina.store(on != 0); }
 
+extern "C" void vk_xr_aim(int on, const double origin[3], const double dir[3]) {
+    Xr &x = xr();
+    std::lock_guard<std::mutex> lk(x.frame_mu);
+    x.aim_on = on != 0;
+    if (on) std::memcpy(x.aim_o, origin, sizeof x.aim_o), std::memcpy(x.aim_d, dir, sizeof x.aim_d);
+}
+
 
 extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3]) {
     Xr &x = xr();
@@ -1640,11 +1714,11 @@ extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3]) {
     const auto world = [&](const float v[3], double out[3]) {
         for (int c = 0; c < 3; c++) out[c] = axes[0][c] * v[0] + axes[1][c] * v[1] + axes[2][c] * v[2];
     };
-    static const float ahead[3] = {0, 0, -1}, upward[3] = {0, 1, 0};
-    float hf[3], hu[3];
-    rotate(head.q, ahead, hf), rotate(head.q, upward, hu);
-    double wf[3], wu[3], wp[3];
-    world(hf, wf), world(hu, wu), world(head.p, wp);
+    static const float ahead[3] = {0, 0, -1}, upward[3] = {0, 1, 0}, rightward[3] = {1, 0, 0};
+    float hf[3], hu[3], hr[3];
+    rotate(head.q, ahead, hf), rotate(head.q, upward, hu), rotate(head.q, rightward, hr);
+    double wf[3], wu[3], wp[3], wr[3];
+    world(hf, wf), world(hu, wu), world(head.p, wp), world(hr, wr);
     for (int c = 0; c < 3; c++) {
         pos[c] += wp[c];
         at[c] = pos[c] + wf[c] * reach;
@@ -1653,6 +1727,17 @@ extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3]) {
     std::lock_guard<std::mutex> lk(x.frame_mu);
     x.frame_on = true;
     x.drawn.tracked = true, x.drawn.pose = head, x.drawn.lens = frustum(eyes, x.picture_ratio.load());
+    x.drawn.aim = x.aim_on;
+    if (x.aim_on) {   // the aim's ray in the view: right, up and back (-forward)
+        double o[3];
+        for (int c = 0; c < 3; c++) o[c] = x.aim_o[c] - pos[c];
+        const double *axis[3] = {wr, wu, wf};
+        for (int k = 0; k < 3; k++) {
+            const double sign = k == 2 ? -1.0 : 1.0;
+            x.drawn.aim_o[k] = (float)(sign * (o[0] * axis[k][0] + o[1] * axis[k][1] + o[2] * axis[k][2]));
+            x.drawn.aim_d[k] = (float)(sign * (x.aim_d[0] * axis[k][0] + x.aim_d[1] * axis[k][1] + x.aim_d[2] * axis[k][2]));
+        }
+    }
     // the game draws a lens this many times the one the headset is told (NX2NAVI_VR_VIEW_SCALE, 100 % by default: the
     // headset's own): more of the world in the same view, everything smaller above 100 %
     x.render_scale = std::fmax(0.5f, std::fmin(2.0f, (float)cfg_int("NX2NAVI_VR_VIEW_SCALE") / 100.0f));
@@ -1807,8 +1892,9 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
         // a wheel open or just closed: the game's HUD left out of the picture too (only the wheel is shown, on the panel)
         int wheel_slot;
         const bool wheel = vk_xr_wheel(&wheel_slot) || plat_now_ns() - x.wheel_closed_at.load() < wheel_hide_ns;
-        made = make_panel(cb, !panel && !wheel);
+        made = make_panel(cb, !panel && !wheel, d.aim && panel ? (int)(0.06f * (float)x.hud_h) : 0);
         hw = x.hud_w, hh = x.hud_h;
+        if (made) make_aim(cb, d);
         if (made && depth) d.stereo = make_eyes(cb, d);
     }
     d.hud = made && panel;
