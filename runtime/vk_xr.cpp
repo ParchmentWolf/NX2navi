@@ -137,6 +137,10 @@ struct Xr {
     Drawn drawn;
     float render_scale = 1.0f;   // the lens the game draws with over the one shown (NX2NAVI_VR_VIEW_SCALE)
     bool aim_on = false;         // vr_game.c vk_xr_aim: Link aims, along the game's own camera's ray (world)
+    // pointed aim (vr_game.c vk_xr_aim_freeze): the view's base yaw held where it was while the controller steers the
+    // game's aim (else the view would turn with the aim it chases); the yaw now (cur) for the controller's ray
+    bool aim_freeze = false, frozen_ok = false;
+    double frozen_bx = 0, frozen_bz = 1, cur_bx = 0, cur_bz = 1;
     double aim_o[3]{}, aim_d[3]{};
     std::atomic<uint32_t> camera_given{0}, lens_given{0}, tracked_pictures{0};
     // the gameplay camera's updates since the last picture, and the pictures in a row with none: a paused game (the
@@ -219,6 +223,8 @@ struct Xr {
     uint64_t hand_buttons = 0;
     float hand_sticks[2][2]{};   // left, right; x right, y up
     Pose grip[2];
+    Pose aim_pose[2];   // the controllers' aim poses (their pointing rays, -z), as their own pointers use
+    bool aim_ok[2]{};
     bool grip_ok[2]{};
     uint64_t hands_at = 0;   // when they were last read (plat_now_ns), 0 never
     int wheel_open = 0;    // a trigger held: 1 the left's D-pad wheel, 2 the right's item wheel (ui/menu.cpp draws them)
@@ -1239,9 +1245,9 @@ struct Controls {
     XrActionSet set = XR_NULL_HANDLE;
     XrAction stick = XR_NULL_HANDLE, click = XR_NULL_HANDLE, trigger = XR_NULL_HANDLE, squeeze = XR_NULL_HANDLE,
              grip = XR_NULL_HANDLE, a = XR_NULL_HANDLE, b = XR_NULL_HANDLE, xb = XR_NULL_HANDLE, yb = XR_NULL_HANDLE,
-             menu = XR_NULL_HANDLE;
+             menu = XR_NULL_HANDLE, aim = XR_NULL_HANDLE;
     XrPath hand[2]{};
-    XrSpace grip_space[2]{};
+    XrSpace grip_space[2]{}, aim_space[2]{};
     bool ok = false;
     bool trigger_on[2]{}, squeeze_on[2]{};
     uint64_t menu_down = 0, plus_until = 0, minus_until = 0;   // plat_now_ns
@@ -1314,6 +1320,7 @@ struct Controls {
         trigger = action("trigger", XR_ACTION_TYPE_FLOAT_INPUT, true);
         squeeze = action("squeeze", XR_ACTION_TYPE_FLOAT_INPUT, true);
         grip = action("grip", XR_ACTION_TYPE_POSE_INPUT, true);
+        aim = action("aim", XR_ACTION_TYPE_POSE_INPUT, true);
         a = action("a", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
         b = action("b", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
         xb = action("x", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
@@ -1328,6 +1335,7 @@ struct Controls {
             {trigger, "/user/hand/left/input/trigger/value"},    {trigger, "/user/hand/right/input/trigger/value"},
             {squeeze, "/user/hand/left/input/squeeze/value"},    {squeeze, "/user/hand/right/input/squeeze/value"},
             {grip, "/user/hand/left/input/grip/pose"},           {grip, "/user/hand/right/input/grip/pose"},
+            {aim, "/user/hand/left/input/aim/pose"},             {aim, "/user/hand/right/input/aim/pose"},
             {a, "/user/hand/right/input/a/click"},               {b, "/user/hand/right/input/b/click"},
             {xb, "/user/hand/left/input/x/click"},               {yb, "/user/hand/left/input/y/click"},
             {menu, "/user/hand/left/input/menu/click"},
@@ -1355,6 +1363,8 @@ struct Controls {
             sci.action = grip, sci.subactionPath = hand[h];
             sci.poseInActionSpace.orientation.w = 1.0f;
             x.xrCreateActionSpace(session, &sci, &grip_space[h]);
+            sci.action = aim;
+            x.xrCreateActionSpace(session, &sci, &aim_space[h]);
         }
         ok = true;
         rt_log("vr: hand controllers bound (Touch)");
@@ -1638,7 +1648,14 @@ struct Controls {
         x.wheel_open = wheel, x.wheel_slot = wheel_slot;
         if (used_kind) x.used_kind = used_kind, x.used_slot = used_slot;
         std::memcpy(x.hand_sticks, sticks, sizeof sticks);
-        for (int h = 0; h < 2; h++) x.grip[h] = poses[h], x.grip_ok[h] = pose_ok[h];
+        for (int h = 0; h < 2; h++) {
+            x.grip[h] = poses[h], x.grip_ok[h] = pose_ok[h];
+            XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
+            const XrSpaceLocationFlags need = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+            x.aim_ok[h] = aim_space[h] && XR_SUCCEEDED(x.xrLocateSpace(aim_space[h], space, time, &loc)) &&
+                          (loc.locationFlags & need) == need;
+            if (x.aim_ok[h]) std::memcpy(x.aim_pose[h].q, &loc.pose.orientation, sizeof x.aim_pose[h].q);
+        }
         x.hands_at = now;
     }
     void log_profile(XrSession session) {
@@ -2231,6 +2248,38 @@ extern "C" void vk_xr_weapon_out(int out) { xr().weapon_out.store(out != 0); }
 
 extern "C" void vk_xr_in_play(int on) { xr().in_play.store(on != 0); }
 
+extern "C" void vk_xr_aim_freeze(int on) {
+    Xr &x = xr();
+    std::lock_guard<std::mutex> lk(x.frame_mu);
+    x.aim_freeze = on != 0;
+}
+
+extern "C" int vk_xr_pointer(double dir[3]) {
+    Xr &x = xr();
+    Pose g;
+    {
+        std::lock_guard<std::mutex> lk(x.hands_mu);
+        const int sword = strcmp(cfg_value("NX2NAVI_VR_HANDEDNESS"), "right") == 0 ? 1 : 0;
+        if (!x.hands_at || plat_now_ns() - x.hands_at > 250000000ull) return 0;
+        if (x.aim_ok[sword]) g = x.aim_pose[sword];   // its own pointing ray; else the grip's
+        else if (x.grip_ok[sword]) g = x.grip[sword];
+        else return 0;
+    }
+    // where the controller points, in the LOCAL space (x right, y up, z back): its aim pose's -z tilted down by
+    // NX2NAVI_VR_AIM_TILT degrees (35 by default, found right for the Quest's Touch controllers)
+    const float tilt = (float)cfg_int("NX2NAVI_VR_AIM_TILT") * 3.14159265f / 180.0f;
+    const float ahead[3] = {0, -std::sin(tilt), -std::cos(tilt)};
+    float v[3];
+    rotate(g.q, ahead, v);
+    double bx, bz;
+    {
+        std::lock_guard<std::mutex> lk(x.frame_mu);
+        bx = x.cur_bx, bz = x.cur_bz;
+    }
+    dir[0] = bz * v[0] + bx * v[2], dir[1] = v[1], dir[2] = -bx * v[0] + bz * v[2];
+    return 1;
+}
+
 extern "C" void vk_xr_hand_item(const char *model) {
     Xr &x = xr();
     std::lock_guard<std::mutex> lk(x.gear_mu);
@@ -2273,7 +2322,15 @@ extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3]) {
     const double reach = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
     const double flat = std::sqrt(f[0] * f[0] + f[2] * f[2]);
     if (!(reach > 1e-6) || !(flat > 1e-6)) return 0;
-    const double bx = -f[0] / flat, bz = -f[2] / flat;
+    double bx = -f[0] / flat, bz = -f[2] / flat;
+    {
+        std::lock_guard<std::mutex> lk(x.frame_mu);
+        if (x.aim_freeze) {
+            if (!x.frozen_ok) x.frozen_bx = bx, x.frozen_bz = bz, x.frozen_ok = true;
+            bx = x.frozen_bx, bz = x.frozen_bz;
+        } else x.frozen_ok = false;
+        x.cur_bx = bx, x.cur_bz = bz;
+    }
     const double axes[3][3] = {{bz, 0, -bx}, {0, 1, 0}, {bx, 0, bz}};   // right, up, back in the world
     const auto world = [&](const float v[3], double out[3]) {
         for (int c = 0; c < 3; c++) out[c] = axes[0][c] * v[0] + axes[1][c] * v[1] + axes[2][c] * v[2];

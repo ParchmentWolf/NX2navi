@@ -63,6 +63,10 @@ void vk_xr_gear(const char *sword, const char *shield);
 void vk_xr_hand_item(const char *model);
 // vr_game.c, the game's thread: in play now (not a menu, a pause, an event), the Touch controllers' play roles on
 void vk_xr_in_play(int on);
+// vr_game.c, the gameplay camera's update: while the controller steers the aim, the view's base yaw held (on); and
+// where the sword hand's controller points, a unit direction in the game's world; 0 when its pose is not known
+void vk_xr_aim_freeze(int on);
+int vk_xr_pointer(double dir[3]);
 // vr_game.c, the gameplay camera's update before vk_xr_camera: Link aims (on) along the game's own camera's ray
 // (origin, unit direction; game units): the head's view draws the reticle where it lands
 void vk_xr_aim(int on, const double origin[3], const double dir[3]);

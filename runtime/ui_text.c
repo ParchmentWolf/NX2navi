@@ -104,8 +104,12 @@ static const char *const text_en[UI_TEXT_COUNT] = {
         "many degrees of looking straight ahead; turn it further and he follows your head. 0: he always follows your "
         "head. Standing still, strafing and backing up are never affected.",
     [UI_MENU_VR_PLAY] = "Play style", [UI_MENU_VR_PLAY_STATIONARY] = "Stationary", [UI_MENU_VR_PLAY_MOTION] = "Motion",
-    [UI_MENU_VR_PLAY_DESC] = "Stationary: Link's own gear and aiming, as on a pad. Motion (Meta/Oculus): the sword and "
-        "shield are held in your hands while Link has them out.",
+    [UI_MENU_VR_PLAY_DESC] = "Stationary: Link's own gear and aiming, as on a pad. Motion (Meta/Oculus): what Link holds "
+        "is in your hands, his own gear hidden, and the slingshot, bow, hookshot and boomerang aim where your sword hand "
+        "points (the game's motion controls on).",
+    [UI_MENU_VR_AIM_TILT] = "Pointing angle",
+    [UI_MENU_VR_AIM_TILT_DESC] = "Motion: how far below the controller's own pointing line your aim goes, in degrees. "
+        "Raise it if the aim sits above where you point, lower it if below.",
     [UI_MENU_VR_SCALE] = "Field of view",
     [UI_MENU_VR_SCALE_DESC] = "How much of the world the view takes in. The default, 100%, matches the headset's lenses exactly. "
         "Higher fits more of the world into your view, so everything looks smaller; lower zooms in. Away from 100%, "

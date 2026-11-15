@@ -17,6 +17,7 @@
 #include "host.h"
 #include "layout.h"
 #include "platform/platform.h"
+#include "input.h"
 #include "vk_xr.h"
 #include "vr_wheel.h"
 #include "vr_game.h"
@@ -300,6 +301,7 @@ void vr_tick(Cpu *c) {
     }
 }
 
+static int g_aiming;   // hand_item: Link aims or holds a ranged item ready now (the bow, slingshot, hookshot, boomerang)
 static uint64_t zr_at, y_at;   // the item button's (ZR) and the sword's (Y) last presses (plat_now_ns), vr_pad
 
 // Whether Link holds something out, and the item in his hand as VR's hands draw it (a model of the game's files), ""
@@ -357,6 +359,7 @@ static int hand_item(char out[96]) {
                         strstr(names, " BowShootUpper ") || strstr(names, " HoldItem") || strstr(names, " Hookshot") ||
                         strstr(names, " FaceBattleBoomerang ")) && now_item;
     if (aiming) held = now_item;
+    g_aiming = aiming;
     static uint64_t out_at;
     const uint64_t t = plat_now_ns();
     if (aiming || strstr(names, " CommonUpper ") || strstr(names, " WeaponEquipOnUpper ") || strstr(names, "Bottle") ||
@@ -445,6 +448,38 @@ static void turn_link(const double ahead[3]) {
     fp_at = plat_now_ns();
 }
 
+// Play style Motion: while Link aims (g_aiming), the game's aim (its camera's ray, d) steered onto where the sword
+// hand's controller points, through the game's own motion aiming: its six-axis sensor is fed turn rates (radians a
+// second, the Switch controller's frame) proportional to the yaw and pitch between the two, every camera update, so
+// the aim follows the controller wherever it points and does not drift; the right stick still adds to it. The view's
+// base yaw is held meanwhile (vk_xr_aim_freeze), else it would turn with the aim it chases. Which of the sensor's
+// axes turn the aim's yaw and pitch: pitch on x, yaw on z (NX2NAVI_VR_GYRO, "x+z+", may change which and which way).
+static double wrap_pi(double a) {
+    while (a > M_PI) a -= 2 * M_PI;
+    while (a < -M_PI) a += 2 * M_PI;
+    return a;
+}
+static void steer_aim(const double d[3]) {
+    const int pointed = d && g_aiming && !strcmp(cfg_value("NX2NAVI_VR_PLAY"), "motion") &&
+                        !strcmp(cfg_value("NX2NAVI_VR_CONTROLS"), "meta") && vk_xr_head_active();
+    vk_xr_aim_freeze(pointed);
+    double t[3];
+    if (!pointed || !vk_xr_pointer(t)) return;
+    const double yaw_err = wrap_pi(atan2(t[0], t[2]) - atan2(d[0], d[2]));
+    const double pitch_err = asin(fmax(-1, fmin(1, t[1]))) - asin(fmax(-1, fmin(1, d[1])));
+    char spec[8] = "x+z+";
+    plat_getenv("NX2NAVI_VR_GYRO", spec, sizeof spec);
+    double gyro[3] = {0, 0, 0};
+    const double k = 10.0, most = 8.0;
+    const double rate[2] = {fmax(-most, fmin(most, k * pitch_err)), fmax(-most, fmin(most, k * yaw_err))};
+    for (int i = 0; i < 2; i++) {
+        const int axis = spec[2 * i] == 'x' ? 0 : spec[2 * i] == 'y' ? 1 : 2;
+        gyro[axis] += spec[2 * i + 1] == '-' ? -rate[i] : rate[i];
+    }
+    static const double acc[3] = {0, 0, -1};   // lying face up, at rest
+    motion_feed(motion_global(), acc, gyro, kern_now_ns());
+}
+
 void vr_camera_update(Cpu *c, int scene) {
     static const int up_reg[3] = {7, 16, 6};
     if (scene != 1 && scene != 2) return;
@@ -478,6 +513,7 @@ void vr_camera_update(Cpu *c, int scene) {
         const double l = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
         if (l > 1e-6) d[0] /= l, d[1] /= l, d[2] /= l;
         vk_xr_aim(aims && l > 1e-6, pos, d);
+        steer_aim(l > 1e-6 ? d : NULL);
     }
     double eye[3];
     if (scene == 1 && vk_xr_head_active() && first_person_eye(eye))   // the game's camera's direction kept, from his eyes
