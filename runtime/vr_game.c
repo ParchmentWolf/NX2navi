@@ -6,8 +6,9 @@
 // there (vr_camera_update). The set vrlens's site is the angle's load (vr_lens_host): the headset's lens replaces it
 // for the same camera. Rendering and the game's culling both follow, as they read what the update made.
 // While an event plays (a cutscene, a conversation) the events' camera follows the head instead, from where the event
-// puts it. In first person, Link faces where the head looks while he stands (turn_link).
+// puts it. In first person, Link faces where the head looks (turn_link) and strafes when moved sideways or back (vr_pad).
 #include <math.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -15,6 +16,7 @@
 #include "debug_tools.h"
 #include "host.h"
 #include "layout.h"
+#include "platform/platform.h"
 #include "vk_xr.h"
 #include "vr_game.h"
 
@@ -101,24 +103,27 @@ static int first_person_eye(double eye[3]) {
     return 1;
 }
 
-// First person's turn of Link toward the view, while he stands upright (not climbing, swimming
-// or hanging), so what he holds and what reacts to his facing follow the head. His facing as the game keeps it, from
-// which his rotation, his physics and the rest are made each frame: the object component 0 points at (+0x60), its 3x4
-// matrix by rows at +0x1f8 (the position in each row's fourth float). Its rotation is made the turn about the vertical
-// toward the view. Walking, the game turns him toward his movement, which the head's view already steers.
+// First person's turn of Link toward the view while he is upright (not climbing, swimming or hanging), so what he holds
+// and what reacts to his facing follow the head. His facing as the game keeps it, from which his rotation, his physics
+// and the rest are made each frame: the object component 0 points at (+0x60), its 3x4 matrix by rows at +0x1f8 (the
+// position in each row's fourth float). Its rotation is made the turn about the vertical toward the view. Running
+// forward, the game turns him toward his movement, which the head's view steers; sideways or back he strafes (vr_pad).
+static _Atomic uint64_t fp_at;   // when Link was last turned to the head in first person
+
+// ov_input.c npad_states: in first person play, while the left stick is pushed sideways or back the game gets ZL held,
+// so Link strafes as Z-targeting does, facing the way he faced (the head's, from running forward or standing). Pushed
+// forward (within 45 degrees) it gets nothing: he runs where the head looks and faces it. The player's own ZL is kept.
+void vr_pad(uint64_t *buttons, int32_t lx, int32_t ly) {
+    if (plat_now_ns() - fp_at > 200000000ull) return;
+    const int64_t m2 = (int64_t)lx * lx + (int64_t)ly * ly;
+    if (m2 < (int64_t)8000 * 8000) return;
+    if (ly > 0 && 2 * (int64_t)ly * ly >= m2) return;
+    *buttons |= 1u << 8;   // ZL
+}
+
 static void turn_link(const double ahead[3]) {
-    static float last[3];
-    static int have_last;
-    float feet[3];
     const uint64_t actor = dbg_player_actor();
-    if (!actor || !dbg_player_pos(feet)) {
-        have_last = 0;
-        return;
-    }
-    const float dx = feet[0] - last[0], dz = feet[2] - last[2];
-    const int standing = have_last && dx * dx + dz * dz < 0.004f * 0.004f;
-    memcpy(last, feet, sizeof last), have_last = 1;
-    if (!standing || strcmp(cfg_value("NX2NAVI_VR_CAMERA"), "first")) return;
+    if (!actor || strcmp(cfg_value("NX2NAVI_VR_CAMERA"), "first")) return;
     const double n = sqrt(ahead[0] * ahead[0] + ahead[2] * ahead[2]);
     if (!(n > 1e-4)) return;
     const float s = (float)(ahead[0] / n), c = (float)(ahead[2] / n);
@@ -132,6 +137,7 @@ static void turn_link(const double ahead[3]) {
     if (fabsf(t[5] - 1.0f) > 0.01f) return;   // not upright now
     const float r[12] = {c, 0, s, t[3], 0, 1, 0, t[7], -s, 0, c, t[11]};
     dbg_poke(facing + 0x1f8, r, sizeof r);
+    fp_at = plat_now_ns();
 }
 
 void vr_camera_update(Cpu *c, int scene) {

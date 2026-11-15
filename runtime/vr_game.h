@@ -10,3 +10,5 @@ void vr_lens_host(Cpu *c);
 void vr_camera_update(Cpu *c, int scene);
 // vk_xr.cpp, the session made with the head's view wanted: the camera hooks switched on
 void vr_game_start(void);
+// ov_input.c npad_states, the pad's buttons and left stick: ZL held for Link's strafe in first person
+void vr_pad(uint64_t *buttons, int32_t lx, int32_t ly);
