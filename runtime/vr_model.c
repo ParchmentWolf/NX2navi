@@ -157,13 +157,34 @@ static int bones_at_rest(const uint8_t *b, size_t n, uint64_t model, float world
     return count;
 }
 
+// the bone named `name`'s index, -1 none
+static int bone_named(const uint8_t *b, size_t n, uint64_t model, const char *name) {
+    const uint64_t sk = le64(b + model + 0x18);
+    if (sk + 0x40 > n || memcmp(b + sk, "FSKL", 4)) return -1;
+    const uint64_t bones = le64(b + sk + 0x10);
+    const size_t len = strlen(name);
+    for (int i = 0, count = le16(b + sk + 0x38); i < count && i < MAX_BONES; i++) {
+        const uint64_t o = bones + 0x58ull * i, nm = o + 8 <= n ? le64(b + o) : n;
+        if (nm + 2 + len <= n && le16(b + nm) == len && !memcmp(b + nm + 2, name, len)) return i;
+    }
+    return -1;
+}
+
+// Link's hand (vr_model_hand): the shapes it is cut from, its side, and from the left hand's bones (the right's mirrored
+// across x) the wrist, the way the fingers point, the way across them from the little finger to the index, and the palm
+typedef struct {
+    const char *const *shapes;
+    float side;                        // +1 the left hand (+x), -1 the right
+    float wrist[3], fingers[3], across[3], palm[3], reach;
+} HandCut;
+
 void vr_model_free(VrModel *m) {
     free(m->verts), free(m->index);
     for (int i = 0; i < m->parts; i++) free(m->part[i].rgba);
     memset(m, 0, sizeof *m);
 }
 
-int vr_model_load(const char *actor, VrModel *out) {
+static int model_load(const char *actor, VrModel *out, HandCut *cut) {
     memset(out, 0, sizeof *out);
     char path[160];
     if (strchr(actor, '.')) snprintf(path, sizeof path, "Model/%s.bfres.zs", actor);   // "<actor>.<model>"
@@ -185,6 +206,28 @@ int vr_model_load(const char *actor, VrModel *out) {
     world = malloc(sizeof(float) * 12 * MAX_BONES);   // the bones at rest (models are read on workers of their own)
     const int bone_n = world ? bones_at_rest(b, n, model, world) : 0;
     const uint64_t sk = le64(b + model + 0x18), mat_bones = sk + 0x20 <= n ? le64(b + sk + 0x18) : 0;
+    if (cut) {   // the hand's frame from the left hand's bones, mirrored for the right
+        const int wr = bone_named(b, n, model, "Wrist_L"), mid = bone_named(b, n, model, "Finger_C_1_L"),
+                  idx = bone_named(b, n, model, "Finger_B_1_L"), lit = bone_named(b, n, model, "Finger_E_1_L"),
+                  pal = bone_named(b, n, model, "Weapon_L");
+        if (wr < 0 || mid < 0 || idx < 0 || lit < 0 || pal < 0 || wr >= bone_n || mid >= bone_n || idx >= bone_n ||
+            lit >= bone_n || pal >= bone_n) {
+            rt_log("vr: hands: %s has no hand bones", actor);
+            goto done;
+        }
+        float f[3], a[3], fl = 0, al = 0, d = 0;
+        for (int c = 0; c < 3; c++) {
+            const float m = c == 0 ? cut->side : 1.0f;
+            cut->wrist[c] = m * world[wr][4 * c + 3], cut->palm[c] = m * world[pal][4 * c + 3];
+            f[c] = m * (world[mid][4 * c + 3] - world[wr][4 * c + 3]), fl += f[c] * f[c];
+            a[c] = m * (world[idx][4 * c + 3] - world[lit][4 * c + 3]);
+        }
+        fl = sqrtf(fl);
+        for (int c = 0; c < 3; c++) f[c] /= fl, d += a[c] * f[c];
+        for (int c = 0; c < 3; c++) a[c] -= d * f[c], al += a[c] * a[c];
+        al = sqrtf(al);
+        for (int c = 0; c < 3; c++) cut->fingers[c] = f[c], cut->across[c] = a[c] / al;
+    }
     // two passes over the shapes: their sizes, then their data
     for (int pass = 0; pass < 2; pass++) {
         uint32_t nv = 0, ni = 0;
@@ -199,9 +242,15 @@ int vr_model_load(const char *actor, VrModel *out) {
             const uint32_t icount = le32(b + mesh + 0x2c), first = le32(b + mesh + 0x30);
             const uint64_t ib = buffers + le32(b + mesh + 0x20);
             if (prim != 3 || !stride || !IN(data, (uint64_t)count * stride) || !IN(ib, (uint64_t)icount * isize)) continue;
-            {   // the slingshot's seeds (shown only as it shoots) left out
+            {   // the slingshot's seeds (shown only as it shoots) left out; a hand's own shapes alone
                 const uint64_t sn = le64(b + s + 8);
                 if (strstr(actor, "SlingShot") && IN(sn, 10) && !memcmp(b + sn + 2, "DekuSeed", 8)) continue;
+                if (cut) {
+                    int keep = 0;
+                    for (const char *const *k = cut->shapes; *k && !keep; k++)
+                        keep = IN(sn, 2 + strlen(*k)) && !memcmp(b + sn + 2, *k, strlen(*k));
+                    if (!keep) continue;
+                }
             }
             if (pass == 1) {
                 uint32_t pos_fmt = 0, nrm_fmt = 0, uv_fmt = 0, pos_at = 0, nrm_at = 0, uv_at = 0, idx_at = UINT32_MAX;
@@ -245,16 +294,34 @@ int vr_model_load(const char *actor, VrModel *out) {
                     }
                     d[0] = p[0], d[1] = p[1], d[2] = p[2], d[3] = q[0], d[4] = q[1], d[5] = q[2], d[6] = u[0], d[7] = u[1];
                 }
-                for (uint32_t i = 0; i < icount; i++) {
-                    const uint32_t k = isize == 4 ? le32(b + ib + 4ull * i) : le16(b + ib + 2ull * i);
-                    out->index[ni + i] = nv + first + k < nv + count ? nv + first + k : nv;
+                uint32_t kept = 0;
+                for (uint32_t i = 0; i + 2 < icount; i += 3) {
+                    uint32_t t[3];
+                    int in = 1;
+                    for (int j = 0; j < 3; j++) {
+                        const uint32_t k = isize == 4 ? le32(b + ib + 4ull * (i + j)) : le16(b + ib + 2ull * (i + j));
+                        t[j] = first + k < count ? nv + first + k : nv;
+                        if (cut) {   // a hand: on its side, past the wrist across the arm and near it
+                            const float *v = out->verts + 8ull * t[j];
+                            float along = 0, far = 0;
+                            for (int c = 0; c < 3; c++) {
+                                const float e = v[c] - cut->wrist[c];
+                                along += e * cut->fingers[c], far += e * e;
+                            }
+                            in = in && v[0] * cut->side > 0 && along > 0 && far < cut->reach * cut->reach;
+                        }
+                    }
+                    if (!in) continue;
+                    memcpy(out->index + ni + kept, t, sizeof t), kept += 3;
                 }
-                if (out->parts < VR_MODEL_PARTS) {
+                if (kept && out->parts < VR_MODEL_PARTS) {
                     VrModelPart *p = &out->part[out->parts++];
                     const uint16_t mi = le16(b + s + 0x52);
-                    p->first = ni, p->count = icount - icount % 3;
+                    p->first = ni, p->count = kept;
                     part_texture(b, n, mi < mat_n ? mats + 0xb0ull * mi : n, actor, p);
                 }
+                nv += count, ni += kept;
+                continue;
             }
             nv += count, ni += icount - icount % 3;
         }
@@ -303,9 +370,39 @@ int vr_model_load(const char *actor, VrModel *out) {
     for (int i = 0; i < out->parts; i++) ok = ok && out->part[i].rgba;
     if (ok) rt_log("vr: hands: %s: %u vertices, %u triangles, %d parts", actor, out->verts_n, out->index_n / 3, out->parts);
 done:
+    if (ok && cut) {   // a hand: its vertices put in the grip's space (x right, y up, z back, metres)
+        // the grip's: the palm toward the handle (the left's to +x, the right's to -x), the index's side forward (-z),
+        // the fingers down and tilted 45 degrees forward; the palm's middle 2 cm from the handle's
+        const float t = 45.0f * 3.14159265f / 180.0f;
+        const float gf[3] = {0, -cosf(t), -sinf(t)}, ga[3] = {0, sinf(t), -cosf(t)};
+        const float gc[3] = {gf[1] * ga[2] - gf[2] * ga[1], gf[2] * ga[0] - gf[0] * ga[2], gf[0] * ga[1] - gf[1] * ga[0]};
+        const float *f = cut->fingers, *a = cut->across;
+        const float c3[3] = {f[1] * a[2] - f[2] * a[1], f[2] * a[0] - f[0] * a[2], f[0] * a[1] - f[1] * a[0]};
+        for (uint32_t v = 0; v < out->verts_n; v++) {
+            float *p = out->verts + 8ull * v, e[3], q[3];
+            for (int c = 0; c < 3; c++) e[c] = p[c] - cut->palm[c], q[c] = p[3 + c];
+            const float u[3] = {e[0] * f[0] + e[1] * f[1] + e[2] * f[2], e[0] * a[0] + e[1] * a[1] + e[2] * a[2],
+                                e[0] * c3[0] + e[1] * c3[1] + e[2] * c3[2]};
+            const float w[3] = {q[0] * f[0] + q[1] * f[1] + q[2] * f[2], q[0] * a[0] + q[1] * a[1] + q[2] * a[2],
+                                q[0] * c3[0] + q[1] * c3[1] + q[2] * c3[2]};
+            for (int c = 0; c < 3; c++) {
+                p[c] = u[0] * gf[c] + u[1] * ga[c] + u[2] * gc[c] - (c == 0 ? cut->side * 0.02f : 0.0f);
+                p[3 + c] = w[0] * gf[c] + w[1] * ga[c] + w[2] * gc[c];
+            }
+        }
+    }
 #undef IN
     free(world);
     free(b);
     if (!ok) vr_model_free(out);
     return ok;
+}
+
+int vr_model_load(const char *actor, VrModel *out) { return model_load(actor, out, NULL); }
+
+int vr_model_hand(int adult, int right, VrModel *out) {
+    static const char *const adult_shapes[] = {"Hand_low", "Glove_Arm_B_low", "Glove_Arm_Metal_A_low", NULL};
+    static const char *const child_shapes[] = {"Skin_Body", NULL};
+    HandCut cut = {adult ? adult_shapes : child_shapes, right ? -1.0f : 1.0f, {0}, {0}, {0}, {0}, adult ? 0.22f : 0.16f};
+    return model_load(adult ? "Player_Adult" : "Player_Child", out, &cut);
 }

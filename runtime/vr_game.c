@@ -277,6 +277,9 @@ void vr_tick(Cpu *c) {
         if (!dbg_text_get("PlayerStatus.EquipWeapon", sword)) sword[0] = 0;
         if (!dbg_text_get("PlayerStatus.EquipShield", shield)) shield[0] = 0;
         vk_xr_gear(sword, shield);
+        int child = 1;
+        dbg_flag_get("Sequence_IsChildhood", &child);
+        vk_xr_child(child);
         vk_xr_weapon_out(hand_item(item));
         vk_xr_hand_item(item);
         hide_gear(item);

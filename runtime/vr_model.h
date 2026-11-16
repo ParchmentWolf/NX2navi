@@ -32,6 +32,9 @@ typedef struct {
 
 // Model/<actor>.<actor>.bfres.zs's (or, for "<actor>.<model>", Model/<actor>.<model>.bfres.zs's) shapes at their finest detail and their materials' "_Alb" textures; 1 when read
 int vr_model_load(const char *actor, VrModel *out);
+// Link's open hand for his age, cut at the wrist from Model/Player_Adult's or Player_Child's, in the controller's grip's
+// space (OpenXR's: x right, y up, z back): the palm toward the handle, the thumb's side forward; 1 when read
+int vr_model_hand(int adult, int right, VrModel *out);
 void vr_model_free(VrModel *m);
 
 #ifdef __cplusplus

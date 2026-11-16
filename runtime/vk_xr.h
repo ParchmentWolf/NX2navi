@@ -65,6 +65,8 @@ void vk_xr_ocarina(int on);
 // vr_game.c, the game's thread: Link holds his sword and shield (or another weapon) out now, so the draw gesture puts
 // them away
 void vk_xr_weapon_out(int out);
+// vr_game.c, each frame: Link is a child (VR's hands draw his own for his age on a hand that holds nothing)
+void vk_xr_child(int child);
 // vr_game.c, the game's thread: the sword and shield equipped, by their actors' names ("" none)
 void vk_xr_gear(const char *sword, const char *shield);
 // vr_game.c, the game's thread: the item Link uses now, by its model (vr_model.c's name), "" none

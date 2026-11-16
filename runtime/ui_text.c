@@ -105,7 +105,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
         "head. Standing still, strafing and backing up are never affected.",
     [UI_MENU_VR_PLAY] = "Play style", [UI_MENU_VR_PLAY_STATIONARY] = "Stationary", [UI_MENU_VR_PLAY_MOTION] = "Motion",
     [UI_MENU_VR_PLAY_DESC] = "Stationary: Link's own gear and aiming, as on a pad. Motion (Meta/Oculus): what Link holds "
-        "is in your hands, his own gear hidden, and the slingshot, bow, hookshot and boomerang aim where your sword hand "
+        "is in your hands, his own gear hidden, his own hand shown on a hand that holds nothing, and the slingshot, bow, hookshot and boomerang aim where your sword hand "
         "points (the game's motion controls on).",
     [UI_MENU_VR_STEREO] = "Stereo", [UI_MENU_VR_STEREO_PERFORMANT] = "Performant",
     [UI_MENU_VR_STEREO_BALANCED] = "Balanced", [UI_MENU_VR_STEREO_ACCURATE] = "Accurate",
