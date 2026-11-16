@@ -1756,8 +1756,9 @@ static void tab_vr(float scale) {
     opt_choice("NX2NAVI_VR_CAMERA", UI_MENU_VR_CAMERA, cameras, 2, UI_MENU_VR_CAMERA_DESC);
     opt_slider("NX2NAVI_VR_VIEW_SCALE", UI_MENU_VR_SCALE, 50, 200, UI_MENU_VR_SCALE_DESC, 5, "%.0f %%");
     {
-        static const UiTextId stereos[] = {UI_MENU_VR_STEREO_PERFORMANT, UI_MENU_VR_STEREO_BALANCED};
-        opt_choice("NX2NAVI_VR_STEREO", UI_MENU_VR_STEREO, stereos, 2, UI_MENU_VR_STEREO_DESC);
+        static const UiTextId stereos[] = {UI_MENU_VR_STEREO_PERFORMANT, UI_MENU_VR_STEREO_BALANCED,
+                                           UI_MENU_VR_STEREO_ACCURATE};
+        opt_choice("NX2NAVI_VR_STEREO", UI_MENU_VR_STEREO, stereos, 3, UI_MENU_VR_STEREO_DESC);
     }
     opt_slider("NX2NAVI_VR_DEPTH", UI_MENU_VR_DEPTH, 0, 200, UI_MENU_VR_DEPTH_DESC, 5, "%.0f %%");
     opt_group(UI_MENU_VR_GROUP_EYES);

@@ -524,6 +524,7 @@ void vr_camera_update(Cpu *c, int scene) {
         const double lift = (child ? 1.27 : 1.80) + cfg_int("NX2NAVI_VR_EVENT_UP") / 100.0;
         pos[1] += lift, at[1] += lift;
     }
+    vk_xr_update_step(frame_step_update_s());
     if (!vk_xr_camera(pos, at, up)) return;
     for (int i = 0; i < 3; i++) set_d(c, i, pos[i]), set_d(c, 3 + i, at[i]), set_s(c, up_reg[i], up[i]);
     memcpy(out_pos[k], pos, sizeof pos), memcpy(out_at[k], at, sizeof at), have_out[k] = 1;

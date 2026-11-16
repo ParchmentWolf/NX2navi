@@ -108,12 +108,15 @@ static const char *const text_en[UI_TEXT_COUNT] = {
         "is in your hands, his own gear hidden, and the slingshot, bow, hookshot and boomerang aim where your sword hand "
         "points (the game's motion controls on).",
     [UI_MENU_VR_STEREO] = "Stereo", [UI_MENU_VR_STEREO_PERFORMANT] = "Performant",
-    [UI_MENU_VR_STEREO_BALANCED] = "Balanced",
+    [UI_MENU_VR_STEREO_BALANCED] = "Balanced", [UI_MENU_VR_STEREO_ACCURATE] = "Accurate",
     [UI_MENU_VR_STEREO_DESC] = "Performant: the game draws one picture and each eye's is made from it and its depth "
         "at the game's full rate; edges beside near things can smear. Balanced: each "
         "frame is drawn from one eye in turn, true depth everywhere with no smearing, but each eye updates at half the "
-        "game's rate, so moving can judder a little: best for slow moving and looking around, Performant for action. The "
-        "desktop window shows the left eye. The Depth row sets how far apart the eyes are in both.",
+        "game's rate, so moving can judder a little: best for slow moving and looking around, Performant for action. "
+        "Accurate: as Balanced, but the game's time stands still for the second eye, so both eyes see the same moment "
+        "and nothing judders; the world moves at half the game's rate, and below about 28 frames a second the game runs "
+        "slower than real time. The desktop window shows the left eye in "
+        "Balanced and Accurate. The Depth row sets how far apart the eyes are in all three.",
     [UI_MENU_VR_AIM_TILT] = "Pointing angle",
     [UI_MENU_VR_AIM_TILT_DESC] = "Motion: how far below the controller's own pointing line your aim goes, in degrees. "
         "Raise it if the aim sits above where you point, lower it if below.",

@@ -237,12 +237,15 @@ struct Xr {
     bool win_hands = false;   // the overlay holds hands this present
     // Stereo Balanced (hud_mu): each eye's latest picture and its pose, and the desktop's left eye kept for the right's
     // presents (the window's picture region, in the window's format)
-    VkImage acc8[2]{};
-    VkImageView acc8_view[2]{};
+    // ([2]: Accurate's left eye's picture, waiting for its right one, both shown together)
+    VkImage acc8[3]{};
+    VkImageView acc8_view[3]{};
     uint32_t acc_w = 0, acc_h = 0;
-    Pose acc_pose[2];
-    double acc_base[2][3]{}, acc_bx[2]{}, acc_bz[2]{1, 1};
-    bool acc_have[2]{};
+    Pose acc_pose[3];
+    double acc_base[3][3]{}, acc_bx[3]{}, acc_bz[3]{1, 1, 1};
+    bool acc_have[3]{};
+    Pose pair_pose[2];   // Accurate: the eyes' poses of the pair shown now
+    bool pair_ok = false;
     VkImage win_left = VK_NULL_HANDLE;
     uint32_t win_left_w = 0, win_left_h = 0;
     VkFormat win_left_format = VK_FORMAT_UNDEFINED;
@@ -582,6 +585,11 @@ bool hud_wanted() { return strcmp(cfg_value("NX2NAVI_VR_HUD"), "panel") == 0; }
 // NX2NAVI_VR_STEREO=balanced: each game frame drawn from one eye in turn (true geometry, each eye at half the rate),
 // rather than performant's depth stereo from the head
 bool stereo_balanced() { return strcmp(cfg_value("NX2NAVI_VR_STEREO"), "balanced") == 0; }
+// NX2NAVI_VR_STEREO=accurate: Balanced's eyes in turn with the game's time held for the right eye's update
+// (frame_rate.c), so both eyes are drawn at one moment and moving does not judder; the world moves at half the rate
+bool stereo_accurate() { return strcmp(cfg_value("NX2NAVI_VR_STEREO"), "accurate") == 0; }
+bool stereo_turns() { return stereo_balanced() || stereo_accurate(); }
+std::atomic<double> update_step{-1};
 
 // (vk_xr_capture, hud_mu held) the scene without the HUD (with it: keep_hud) and the HUD's panel made from the target as
 // it is now and the scene kept from before the HUD, the panel clear within `cut` pixels of its middle (the game's
@@ -1365,21 +1373,35 @@ void keep_eye(VkCommandBuffer cb, Drawn &d) {
     Xr &x = xr();
     if (!x.acc8[0] || x.acc_w != x.hud_w || x.acc_h != x.hud_h) {   // (another size's are left behind)
         const VkImageUsageFlags u = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        for (int e = 0; e < 2; e++)
+        for (int e = 0; e < 3; e++)
             if (!make_image(x.hud_w, x.hud_h, VK_FORMAT_R8G8B8A8_UNORM, u, x.acc8[e], x.acc8_view[e])) {
-                x.acc8[0] = x.acc8[1] = VK_NULL_HANDLE;
+                x.acc8[0] = x.acc8[1] = x.acc8[2] = VK_NULL_HANDLE;
                 return;
             }
-        x.acc_w = x.hud_w, x.acc_h = x.hud_h, x.acc_have[0] = x.acc_have[1] = false;
-        for (int e = 0; e < 2; e++) barrier(cb, x.acc8[e], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        x.acc_w = x.hud_w, x.acc_h = x.hud_h, x.acc_have[0] = x.acc_have[1] = x.acc_have[2] = false, x.pair_ok = false;
+        for (int e = 0; e < 3; e++) barrier(cb, x.acc8[e], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     }
+    // Accurate: the left eye's picture waits in [2] while the pair before stays shown, and goes to [0] with its right
+    const bool paired = stereo_accurate();
+    if (!paired) x.pair_ok = false;
+    const int into = paired && d.eye == 0 ? 2 : d.eye;
     VkImageCopy c{};
     c.srcSubresource = c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     c.extent = {x.hud_w, x.hud_h, 1};
-    vkCmdCopyImage(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, x.acc8[d.eye], VK_IMAGE_LAYOUT_GENERAL, 1, &c);
-    barrier(cb, x.acc8[d.eye], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
-    x.acc_pose[d.eye] = d.pose, x.acc_have[d.eye] = true;
-    std::memcpy(x.acc_base[d.eye], d.base, sizeof d.base), x.acc_bx[d.eye] = d.bx, x.acc_bz[d.eye] = d.bz;
+    vkCmdCopyImage(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, x.acc8[into], VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    barrier(cb, x.acc8[into], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    x.acc_pose[into] = d.pose, x.acc_have[into] = true;
+    std::memcpy(x.acc_base[into], d.base, sizeof d.base), x.acc_bx[into] = d.bx, x.acc_bz[into] = d.bz;
+    if (paired) {
+        if (d.eye == 0) {
+            if (x.pair_ok) d.stereo = true, d.eye_pose[0] = x.pair_pose[0], d.eye_pose[1] = x.pair_pose[1];
+            return;
+        }
+        if (!x.acc_have[2]) return;
+        std::swap(x.acc8[0], x.acc8[2]), std::swap(x.acc8_view[0], x.acc8_view[2]);
+        x.acc_pose[0] = x.acc_pose[2], std::memcpy(x.acc_base[0], x.acc_base[2], sizeof x.acc_base[0]);
+        x.acc_bx[0] = x.acc_bx[2], x.acc_bz[0] = x.acc_bz[2], x.acc_have[0] = true, x.acc_have[2] = false;
+    }
     if (x.acc_have[0] && x.acc_have[1]) {
         d.stereo = true;
         d.eye_pose[d.eye] = d.pose;
@@ -1406,6 +1428,7 @@ void keep_eye(VkCommandBuffer cb, Drawn &d) {
         moved.q[2] = a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3];
         moved.q[3] = a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2];
         d.eye_pose[o] = moved;
+        if (paired) x.pair_pose[0] = d.eye_pose[0], x.pair_pose[1] = d.eye_pose[1], x.pair_ok = true;
     }
 }
 
@@ -2426,7 +2449,7 @@ extern "C" void vk_xr_device_ready(VkInstance instance, VkPhysicalDevice phys, V
 extern "C" int vk_xr_head_wanted(void) { return xr().ok && strcmp(cfg_value("NX2NAVI_VR_VIEW"), "head") == 0; }
 
 extern "C" int vk_xr_depth_wanted(void) {   // (Balanced keeps the depth too: the hands and the reticle are hidden by it)
-    return vk_xr_head_wanted() && (cfg_int("NX2NAVI_VR_DEPTH") > 0 || stereo_balanced());
+    return vk_xr_head_wanted() && (cfg_int("NX2NAVI_VR_DEPTH") > 0 || stereo_turns());
 }
 
 extern "C" void vk_xr_keep_depth(VkCommandBuffer cb, VkImageView depth, uint32_t w, uint32_t h) {
@@ -2606,6 +2629,14 @@ extern "C" void vk_xr_aim(int on, const double origin[3], const double dir[3]) {
 }
 
 
+extern "C" int vk_xr_holds_time(void) {
+    Xr &x = xr();
+    return stereo_accurate() && x.ok && x.head_view.load(std::memory_order_relaxed) &&
+           x.running.load(std::memory_order_relaxed);
+}
+
+extern "C" void vk_xr_update_step(double seconds) { update_step.store(seconds, std::memory_order_relaxed); }
+
 extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3]) {
     Xr &x = xr();
     if (!x.ok || !x.head_view.load(std::memory_order_relaxed) || !x.running.load(std::memory_order_relaxed)) {
@@ -2646,9 +2677,11 @@ extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3]) {
     // Stereo Balanced: this picture from one eye, the other the next (eyes in turn): the head moved half the eyes'
     // distance (NX2NAVI_VR_DEPTH percent of it, as depth stereo's) to that eye's side, the game's camera with it
     int eye = -1;
-    if (stereo_balanced()) {
+    if (stereo_turns()) {
         {
             std::lock_guard<std::mutex> lk(x.frame_mu);
+            const double step = update_step.load(std::memory_order_relaxed);
+            if (stereo_accurate() && step > 0) x.turn = step < 0.006 ? 1 : 0;   // the held update draws the right eye
             eye = x.turn, x.turn ^= 1;
         }
         const float strength = 0.01f * (float)cfg_int("NX2NAVI_VR_DEPTH");

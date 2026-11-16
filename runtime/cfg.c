@@ -252,7 +252,7 @@ static const CfgMeta metas[] = {
     {"VR_DEPTH", "100", "0..200", LIVE},
     // vk_xr.cpp: stereo by depth (performant: one picture, each eye made from it and its depth) or by eyes in turn
     // (balanced: each frame drawn from one eye, true geometry, each eye at half the rate)
-    {"VR_STEREO", "performant", "performant|balanced", LIVE},
+    {"VR_STEREO", "performant", "performant|balanced|accurate", LIVE},
     {"MONITOR", "auto", NULL, RESTART},   // auto|primary|<1-based index>|<part of a monitor name> (gfx_window_win.c, gfx_window_sdl.c chosen_monitor)
     {"PERF_OVERLAY", "off", "off|fps|full", LIVE},
     {"OUTPUT_RES", "1920x1080", NULL, RESTART}, {"RENDER_SCALE", "game", "game|50|67|75|100|125|150|200", RESTART},
