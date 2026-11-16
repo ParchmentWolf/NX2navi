@@ -87,7 +87,7 @@ static const char *const known[] = {
     "TEX_COMPACT", "TEX_COMPACT_MIN_MB", "TEX_COMPACT_FRAME_MB",   // texture compaction (vk_texture.c); no menu row
     "STANDIN_FILTER",   // the filter of the scene upscaler's stand-in (vk_tonemap.c); no menu row
     "VR", "VR_SCREEN_SIZE", "VR_SCREEN_CURVE", "VR_VIEW", "VR_CAMERA", "VR_EYE_UP", "VR_EYE_SIDE", "VR_EYE_FORWARD", "VR_HUD", "VR_HUD_SIZE", "VR_VIEW_SCALE",
-    "VR_DEPTH", "VR_CONTROLS", "VR_SWING_SPEED", "VR_CHARGE_REACH", "VR_HANDEDNESS", "VR_EVENT_UP", "VR_RUN_ZONE", "VR_PLAY", "VR_AIM_TILT",
+    "VR_DEPTH", "VR_CONTROLS", "VR_SWING_SPEED", "VR_CHARGE_REACH", "VR_HANDEDNESS", "VR_EVENT_UP", "VR_RUN_ZONE", "VR_PLAY", "VR_AIM_TILT", "VR_STEREO",
     "PATCH_VR_LENS",   // VR through OpenXR (vk_xr.cpp, vr_game.c)
     // retired: the settings of the co-op of versions up to 0.9.2; read by nothing, listed so that a file which still
     // sets them logs no unknown key
@@ -175,7 +175,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"TEX_COMPACT", "performance"}, {"TEX_COMPACT_MIN_MB", "performance"}, {"TEX_COMPACT_FRAME_MB", "performance"},
     {"VR", "vr"}, {"VR_SCREEN_SIZE", "vr"}, {"VR_SCREEN_CURVE", "vr"}, {"VR_VIEW", "vr"}, {"VR_CAMERA", "vr"}, {"VR_EYE_UP", "vr"}, {"VR_EYE_SIDE", "vr"},
     {"VR_EYE_FORWARD", "vr"}, {"VR_HUD", "vr"}, {"VR_HUD_SIZE", "vr"}, {"VR_VIEW_SCALE", "vr"}, {"VR_DEPTH", "vr"},
-    {"VR_CONTROLS", "vr"}, {"VR_SWING_SPEED", "vr"}, {"VR_CHARGE_REACH", "vr"}, {"VR_HANDEDNESS", "vr"}, {"VR_EVENT_UP", "vr"}, {"VR_RUN_ZONE", "vr"}, {"VR_PLAY", "vr"}, {"VR_AIM_TILT", "vr"},
+    {"VR_CONTROLS", "vr"}, {"VR_SWING_SPEED", "vr"}, {"VR_CHARGE_REACH", "vr"}, {"VR_HANDEDNESS", "vr"}, {"VR_EVENT_UP", "vr"}, {"VR_RUN_ZONE", "vr"}, {"VR_PLAY", "vr"}, {"VR_AIM_TILT", "vr"}, {"VR_STEREO", "vr"},
 };
 
 // The settings the menu shows: the value in effect when the key is unset, and what the key accepts. The only place a
@@ -226,6 +226,9 @@ static const CfgMeta metas[] = {
     {"VR_VIEW_SCALE", "100", "50..200", LIVE},
     // vk_xr.cpp: depth stereo, each eye this many percent of half the eyes' distance to its side (0: both eyes one picture)
     {"VR_DEPTH", "100", "0..200", LIVE},
+    // vk_xr.cpp: stereo by depth (performant: one picture, each eye made from it and its depth) or by eyes in turn
+    // (balanced: each frame drawn from one eye, true geometry, each eye at half the rate)
+    {"VR_STEREO", "performant", "performant|balanced", LIVE},
     {"MONITOR", "auto", NULL, RESTART},   // auto|primary|<1-based index>|<part of a monitor name> (gfx_window_win.c, gfx_window_sdl.c chosen_monitor)
     {"PERF_OVERLAY", "off", "off|fps|full", LIVE},
     {"OUTPUT_RES", "1920x1080", NULL, RESTART}, {"RENDER_SCALE", "game", "game|50|67|75|100|125|150|200", RESTART},

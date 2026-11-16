@@ -32,6 +32,9 @@ int vk_xr_depth_wanted(void);
 // vk_dlaa.c, once the scene is drawn and before later passes reuse its depth target: the scene's depth (a sampled
 // view, in GENERAL) copied for this frame's depth stereo; binds a compute pipeline and push descriptors of its own
 void vk_xr_keep_depth(VkCommandBuffer cb, VkImageView depth, uint32_t w, uint32_t h);
+// vk_dlaa.c, with the depth: the view the scene was drawn with (rows 0-2 of its 3x4 view: right, up, back, each with
+// its translation), so the picture is matched to the camera update that gave it (the game draws a frame behind them)
+void vk_xr_scene_camera(const float rows[12]);
 // The head's view is on now (the session running, the menu closed): vr_game.c's first person applies
 int vk_xr_head_active(void);
 // vr_game.c, the gameplay camera's update: 1 when the head's view applies now, the camera's position, target and up

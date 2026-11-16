@@ -84,6 +84,11 @@ struct Drawn {
     Lens lens;
     float scale = 1.0f;    // the lens the game drew with over the one shown (NX2NAVI_VR_VIEW_SCALE)
     float ipd = 0.064f;    // the eyes' distance, metres
+    int eye = -1;          // Stereo Balanced (eyes in turn): the eye the picture was drawn from (0 left, 1 right)
+    Pose eye_pose[2];      // with stereo then: each eye's picture's own pose (stereo's boxes hold the two latest)
+    // where the LOCAL space sat in the game's world for this picture: world = base + right * x + up * y + back * z,
+    // right (bz, 0, -bx), back (bx, 0, bz) (Balanced: the older eye's picture is put in the newer one's LOCAL space)
+    double base[3]{}, bx = 0, bz = 1;
     bool aim = false;      // Link aims: the game's camera's ray (aim_o, aim_d) in the head's view (x right, y up, z back)
     float aim_o[3]{}, aim_d[3]{};
 };
@@ -143,6 +148,17 @@ struct Xr {
     // pointed aim (vr_game.c vk_xr_aim_freeze): the view's base yaw held where it was while the controller steers the
     // game's aim (else the view would turn with the aim it chases); the yaw now (cur) for the controller's ray
     bool aim_freeze = false, frozen_ok = false;
+    int turn = 0;   // Stereo Balanced: the eye the next camera update draws from (frame_mu)
+    // the last camera updates' pictures to be (frame_mu), with the camera's place in the world each gave, and the place
+    // the last scene was drawn from (vk_xr_scene_camera): a picture is matched to its own update by the nearest
+    struct Given {
+        Drawn d;
+        double at[3];
+        bool used;
+    } given[6];
+    int given_next = 0;
+    double scene_at[3]{};
+    bool scene_new = false;
     double frozen_bx = 0, frozen_bz = 1, cur_bx = 0, cur_bz = 1;
     double aim_o[3]{}, aim_d[3]{};
     std::atomic<uint32_t> camera_given{0}, lens_given{0}, tracked_pictures{0};
@@ -219,6 +235,18 @@ struct Xr {
     VkImageView win_overlay_view = VK_NULL_HANDLE;
     uint32_t win_overlay_w = 0, win_overlay_h = 0;
     bool win_hands = false;   // the overlay holds hands this present
+    // Stereo Balanced (hud_mu): each eye's latest picture and its pose, and the desktop's left eye kept for the right's
+    // presents (the window's picture region, in the window's format)
+    VkImage acc8[2]{};
+    VkImageView acc8_view[2]{};
+    uint32_t acc_w = 0, acc_h = 0;
+    Pose acc_pose[2];
+    double acc_base[2][3]{}, acc_bx[2]{}, acc_bz[2]{1, 1};
+    bool acc_have[2]{};
+    VkImage win_left = VK_NULL_HANDLE;
+    uint32_t win_left_w = 0, win_left_h = 0;
+    VkFormat win_left_format = VK_FORMAT_UNDEFINED;
+    bool win_left_have = false;
     VkDescriptorSetLayout blit_set = VK_NULL_HANDLE;
     VkPipelineLayout blit_layout = VK_NULL_HANDLE;
     VkPipeline blit_pipe = VK_NULL_HANDLE;
@@ -550,6 +578,10 @@ bool make_hud_pipeline() {
 }
 
 bool hud_wanted() { return strcmp(cfg_value("NX2NAVI_VR_HUD"), "panel") == 0; }
+
+// NX2NAVI_VR_STEREO=balanced: each game frame drawn from one eye in turn (true geometry, each eye at half the rate),
+// rather than performant's depth stereo from the head
+bool stereo_balanced() { return strcmp(cfg_value("NX2NAVI_VR_STEREO"), "balanced") == 0; }
 
 // (vk_xr_capture, hud_mu held) the scene without the HUD (with it: keep_hud) and the HUD's panel made from the target as
 // it is now and the scene kept from before the HUD, the panel clear within `cut` pixels of its middle (the game's
@@ -1325,6 +1357,94 @@ void hands_onto_window(VkCommandBuffer cb, VkImage window, VkExtent2D extent, Vk
     vkCmdDraw(cb, 3, 1, 0, 0);
     vkCmdEndRendering(cb);
     barrier(cb, window, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+}
+
+// Stereo Balanced (vk_xr_capture, hud_mu held, after make_hands): this eye's picture (scene8, drawn from it) kept with
+// its pose; once both eyes have one the picture is shown in stereo, each eye its latest at its own pose
+void keep_eye(VkCommandBuffer cb, Drawn &d) {
+    Xr &x = xr();
+    if (!x.acc8[0] || x.acc_w != x.hud_w || x.acc_h != x.hud_h) {   // (another size's are left behind)
+        const VkImageUsageFlags u = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        for (int e = 0; e < 2; e++)
+            if (!make_image(x.hud_w, x.hud_h, VK_FORMAT_R8G8B8A8_UNORM, u, x.acc8[e], x.acc8_view[e])) {
+                x.acc8[0] = x.acc8[1] = VK_NULL_HANDLE;
+                return;
+            }
+        x.acc_w = x.hud_w, x.acc_h = x.hud_h, x.acc_have[0] = x.acc_have[1] = false;
+        for (int e = 0; e < 2; e++) barrier(cb, x.acc8[e], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    }
+    VkImageCopy c{};
+    c.srcSubresource = c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    c.extent = {x.hud_w, x.hud_h, 1};
+    vkCmdCopyImage(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, x.acc8[d.eye], VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    barrier(cb, x.acc8[d.eye], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    x.acc_pose[d.eye] = d.pose, x.acc_have[d.eye] = true;
+    std::memcpy(x.acc_base[d.eye], d.base, sizeof d.base), x.acc_bx[d.eye] = d.bx, x.acc_bz[d.eye] = d.bz;
+    if (x.acc_have[0] && x.acc_have[1]) {
+        d.stereo = true;
+        d.eye_pose[d.eye] = d.pose;
+        // the other eye's picture, drawn a frame before with Link (and the game's camera) elsewhere in the world: its
+        // pose put in this picture's LOCAL space, local = A_now^T (base_then - base_now + A_then local_then), turned by
+        // the yaw between the two
+        const int o = 1 - d.eye;
+        const Pose &then = x.acc_pose[o];
+        const double ob = x.acc_bx[o], oz = x.acc_bz[o];
+        const double then_axes[3][3] = {{oz, 0, -ob}, {0, 1, 0}, {ob, 0, oz}}, now_axes[3][3] = {{d.bz, 0, -d.bx}, {0, 1, 0}, {d.bx, 0, d.bz}};
+        double w[3];
+        for (int c = 0; c < 3; c++)
+            w[c] = x.acc_base[o][c] - d.base[c] + then_axes[0][c] * then.p[0] + then_axes[1][c] * then.p[1] + then_axes[2][c] * then.p[2];
+        Pose moved = then;
+        for (int k = 0; k < 3; k++) moved.p[k] = (float)(now_axes[k][0] * w[0] + now_axes[k][1] * w[1] + now_axes[k][2] * w[2]);
+        // the yaw from then's axes to now's: then's right in now's axes (cos, and the back component as sin)
+        const double c0 = now_axes[0][0] * then_axes[0][0] + now_axes[0][2] * then_axes[0][2];
+        const double s0 = now_axes[2][0] * then_axes[0][0] + now_axes[2][2] * then_axes[0][2];
+        const double half = 0.5 * std::atan2(-s0, c0);
+        const float qy[4] = {0, (float)std::sin(half), 0, (float)std::cos(half)};   // about y, x y z w
+        const float *a = qy, *b = then.q;   // moved.q = qy * then.q
+        moved.q[0] = a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1];
+        moved.q[1] = a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0];
+        moved.q[2] = a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3];
+        moved.q[3] = a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2];
+        d.eye_pose[o] = moved;
+    }
+}
+
+// the image an eye's picture is in with stereo: Balanced's kept pictures, else depth stereo's
+VkImage eye_image(const Drawn &d, int e) { return d.eye >= 0 ? xr().acc8[e] : xr().eye8[e]; }
+
+// Stereo Balanced (vk_xr_capture, last, hud_mu held): the desktop shows the left eye. Its presents' window picture
+// (with the HUD and the hands) is kept, and put back over the window on the right eye's presents, so the window does
+// not shift between the eyes every frame; the window back in TRANSFER_SRC after
+void window_left_eye(VkCommandBuffer cb, VkImage window, VkExtent2D extent, VkFormat format, const int rect[4], int eye) {
+    Xr &x = xr();
+    int to[4];
+    gfx_fit_rect(rect[2], rect[3], (int)extent.width, (int)extent.height, to);
+    if (to[2] <= 0 || to[3] <= 0) return;
+    if (!x.win_left || x.win_left_w != (uint32_t)to[2] || x.win_left_h != (uint32_t)to[3] || x.win_left_format != format) {
+        x.win_left_have = false;
+        VkImageView unused = VK_NULL_HANDLE;
+        if (!make_image((uint32_t)to[2], (uint32_t)to[3], format, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                        x.win_left, unused)) {
+            x.win_left = VK_NULL_HANDLE;
+            return;
+        }
+        x.win_left_w = (uint32_t)to[2], x.win_left_h = (uint32_t)to[3], x.win_left_format = format;
+        barrier(cb, x.win_left, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    }
+    VkImageCopy c{};
+    c.srcSubresource = c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    c.extent = {(uint32_t)to[2], (uint32_t)to[3], 1};
+    if (eye == 0) {
+        c.srcOffset = {to[0], to[1], 0};
+        vkCmdCopyImage(cb, window, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, x.win_left, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        barrier(cb, x.win_left, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+        x.win_left_have = true;
+    } else if (x.win_left_have) {
+        c.dstOffset = {to[0], to[1], 0};
+        barrier(cb, window, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vkCmdCopyImage(cb, x.win_left, VK_IMAGE_LAYOUT_GENERAL, window, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+        barrier(cb, window, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    }
 }
 
 // (vk_xr_capture, hud_mu held, after make_panel) each eye's picture from the scene make_panel left in scene8 and this
@@ -2147,9 +2267,10 @@ void run(void *) {
                                                   {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
         for (int e = 0; e < 2; e++) {
             XrCompositionLayerProjectionView &v = pv[e];
-            std::memcpy(&v.pose.orientation, shown_drawn.pose.q, sizeof shown_drawn.pose.q);
-            float at[3] = {shown_drawn.pose.p[0], shown_drawn.pose.p[1], shown_drawn.pose.p[2]};
-            if (shown_drawn.stereo) {
+            const Pose &own = shown_drawn.stereo && shown_drawn.eye >= 0 ? shown_drawn.eye_pose[e] : shown_drawn.pose;
+            std::memcpy(&v.pose.orientation, own.q, sizeof own.q);
+            float at[3] = {own.p[0], own.p[1], own.p[2]};
+            if (shown_drawn.stereo && shown_drawn.eye < 0) {   // (Balanced's eyes are at their own poses already)
                 const float side[3] = {(e ? 0.5f : -0.5f) * shown_drawn.ipd, 0, 0};
                 float off[3];
                 rotate(shown_drawn.pose.q, side, off);
@@ -2304,7 +2425,9 @@ extern "C" void vk_xr_device_ready(VkInstance instance, VkPhysicalDevice phys, V
 
 extern "C" int vk_xr_head_wanted(void) { return xr().ok && strcmp(cfg_value("NX2NAVI_VR_VIEW"), "head") == 0; }
 
-extern "C" int vk_xr_depth_wanted(void) { return vk_xr_head_wanted() && cfg_int("NX2NAVI_VR_DEPTH") > 0; }
+extern "C" int vk_xr_depth_wanted(void) {   // (Balanced keeps the depth too: the hands and the reticle are hidden by it)
+    return vk_xr_head_wanted() && (cfg_int("NX2NAVI_VR_DEPTH") > 0 || stereo_balanced());
+}
 
 extern "C" void vk_xr_keep_depth(VkCommandBuffer cb, VkImageView depth, uint32_t w, uint32_t h) {
     Xr &x = xr();
@@ -2421,6 +2544,15 @@ extern "C" void vk_xr_weapon_out(int out) { xr().weapon_out.store(out != 0); }
 
 extern "C" void vk_xr_in_play(int on) { xr().in_play.store(on != 0); }
 
+extern "C" void vk_xr_scene_camera(const float r[12]) {
+    Xr &x = xr();
+    double at[3];   // the camera's place: -R^T t
+    for (int c = 0; c < 3; c++) at[c] = -(r[c] * r[3] + r[4 + c] * r[7] + r[8 + c] * r[11]);
+    if (!std::isfinite(at[0]) || !std::isfinite(at[1]) || !std::isfinite(at[2])) return;
+    std::lock_guard<std::mutex> lk(x.frame_mu);
+    std::memcpy(x.scene_at, at, sizeof at), x.scene_new = true;
+}
+
 extern "C" void vk_xr_aim_freeze(int on) {
     Xr &x = xr();
     std::lock_guard<std::mutex> lk(x.frame_mu);
@@ -2511,8 +2643,20 @@ extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3]) {
     static const float ahead[3] = {0, 0, -1}, upward[3] = {0, 1, 0}, rightward[3] = {1, 0, 0};
     float hf[3], hu[3], hr[3];
     rotate(head.q, ahead, hf), rotate(head.q, upward, hu), rotate(head.q, rightward, hr);
+    // Stereo Balanced: this picture from one eye, the other the next (eyes in turn): the head moved half the eyes'
+    // distance (NX2NAVI_VR_DEPTH percent of it, as depth stereo's) to that eye's side, the game's camera with it
+    int eye = -1;
+    if (stereo_balanced()) {
+        {
+            std::lock_guard<std::mutex> lk(x.frame_mu);
+            eye = x.turn, x.turn ^= 1;
+        }
+        const float strength = 0.01f * (float)cfg_int("NX2NAVI_VR_DEPTH");
+        for (int c = 0; c < 3; c++) head.p[c] += (eye ? 0.5f : -0.5f) * ipd * strength * hr[c];
+    }
     double wf[3], wu[3], wp[3], wr[3];
     world(hf, wf), world(hu, wu), world(head.p, wp), world(hr, wr);
+    double base[3] = {pos[0], pos[1], pos[2]};
     for (int c = 0; c < 3; c++) {
         pos[c] += wp[c];
         at[c] = pos[c] + wf[c] * reach;
@@ -2521,6 +2665,8 @@ extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3]) {
     std::lock_guard<std::mutex> lk(x.frame_mu);
     x.frame_on = true;
     x.drawn.tracked = true, x.drawn.pose = head, x.drawn.lens = frustum(eyes, x.picture_ratio.load());
+    x.drawn.eye = eye;
+    std::memcpy(x.drawn.base, base, sizeof base), x.drawn.bx = bx, x.drawn.bz = bz;
     x.drawn.aim = x.aim_on;
     if (x.aim_on) {   // the aim's ray in the view: right, up and back (-forward)
         double o[3];
@@ -2537,6 +2683,9 @@ extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3]) {
     x.render_scale = std::fmax(0.5f, std::fmin(2.0f, (float)cfg_int("NX2NAVI_VR_VIEW_SCALE") / 100.0f));
     x.drawn.scale = x.render_scale, x.drawn.ipd = ipd;
     x.camera_given++;
+    Xr::Given &g = x.given[x.given_next++ % 6];
+    g.d = x.drawn, g.used = true;
+    for (int c = 0; c < 3; c++) g.at[c] = pos[c];
     x.updates++;
     return 1;
 }
@@ -2642,6 +2791,16 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
     if (head && x.stale < 3) {
         std::lock_guard<std::mutex> lk(x.frame_mu);
         d = x.drawn;
+        if (x.scene_new) {   // the camera update this picture was drawn from: the one whose place the scene's camera had
+            double best = 1e30;
+            for (const auto &g : x.given) {
+                if (!g.used) continue;
+                double e2 = 0;
+                for (int c = 0; c < 3; c++) e2 += (g.at[c] - x.scene_at[c]) * (g.at[c] - x.scene_at[c]);
+                if (e2 < best) best = e2, d = g.d;
+            }
+            x.scene_new = false;
+        }
     }
     if (!head) x.frozen.tracked = false;
     if (head && x.stale >= 3 && x.frozen.tracked) {   // paused: the frozen world, and the game's picture on the HUD's panel
@@ -2658,7 +2817,7 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
             for (int e = 0; e < (d.stereo ? 2 : 1); e++) {
                 const VkImage bx = e ? x.boxes_r[slot] : x.boxes[slot];
                 barrier(cb, bx, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-                vkCmdBlitImage(cb, d.stereo ? x.eye8[e] : x.scene8, VK_IMAGE_LAYOUT_GENERAL, bx,
+                vkCmdBlitImage(cb, d.stereo ? eye_image(d, e) : x.scene8, VK_IMAGE_LAYOUT_GENERAL, bx,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
                 barrier(cb, bx, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             }
@@ -2689,8 +2848,9 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
         made = make_panel(cb, !panel && !wheel, d.aim && panel ? (int)(0.06f * (float)x.hud_h) : 0);
         hw = x.hud_w, hh = x.hud_h;
         if (made) make_aim(cb, d);
-        if (made && depth) d.stereo = make_eyes(cb, d);
+        if (made && depth && d.eye < 0) d.stereo = make_eyes(cb, d);
         x.win_hands = made && make_hands(cb, d);
+        if (made && d.eye >= 0) keep_eye(cb, d);   // Balanced: this eye's picture kept, both shown once both are
     }
     d.hud = made && panel;
     if (d.tracked && made) x.frozen = d;   // its world stays in scene8 and eye8 until the next one made
@@ -2703,12 +2863,13 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
     b.dstOffsets[1] = {(int32_t)x.width, (int32_t)x.height, 1};
     if (made) {
         b.srcOffsets[1] = {(int32_t)hw, (int32_t)hh, 1};
-        vkCmdBlitImage(cb, d.stereo ? x.eye8[0] : x.scene8, VK_IMAGE_LAYOUT_GENERAL, box, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                       1, &b, VK_FILTER_LINEAR);
+        vkCmdBlitImage(cb, d.stereo ? eye_image(d, 0) : x.scene8, VK_IMAGE_LAYOUT_GENERAL, box,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
         if (d.stereo) {
             const VkImage rb = x.boxes_r[slot];
             barrier(cb, rb, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            vkCmdBlitImage(cb, x.eye8[1], VK_IMAGE_LAYOUT_GENERAL, rb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+            vkCmdBlitImage(cb, eye_image(d, 1), VK_IMAGE_LAYOUT_GENERAL, rb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
+                           VK_FILTER_LINEAR);
             barrier(cb, rb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         }
         if (d.hud) {
@@ -2730,9 +2891,10 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
     if (d.tracked) {
         overlay_onto_hud(cb, slot, window, extent, d);
         x.box_drawn[slot] = d;
-        if (x.win_hands && have_picture) {   // last: the headset's copies are made
+        if (have_picture) {   // last: the headset's copies are made
             std::lock_guard<std::mutex> lk(x.hud_mu);
-            hands_onto_window(cb, window, extent, format, rect);
+            if (x.win_hands && d.eye != 1) hands_onto_window(cb, window, extent, format, rect);
+            if (d.eye >= 0) window_left_eye(cb, window, extent, format, rect, d.eye);
         }
     }
     x.pending = slot;

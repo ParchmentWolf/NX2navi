@@ -3175,6 +3175,7 @@ static void vr_only_frame(VkExec *ex) {
     VkImageView zv = vk_exec_target_view(z->img, z->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, z->level,
                                          z->base_layer, 1, 0);
     vk_xr_keep_depth(ex->cb, zv, D.color.width, D.color.height);
+    if (cr) vk_xr_scene_camera(cr);   // (rows 0-2: the view the scene was drawn with)
     vk_exec_draw_new_cb();   // VR's copy bound a pipeline and descriptors of its own: the next draw binds all again
     D.jdepth = z->image, D.jw = z->width, D.jh = z->height;   // the scene depth the camera's draws go to (vk_dlaa_draw)
     D.fg_at = D.presents, D.jit_ok = 0;
