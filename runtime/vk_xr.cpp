@@ -41,12 +41,15 @@ extern "C" {
 #include "xr_aim_spv.h"
 #include "xr_depth_keep_spv.h"
 #include "xr_depth_spv.h"
+#include "xr_hand_blit_fs_spv.h"
+#include "xr_hand_blit_vs_spv.h"
 #include "xr_hand_fs_spv.h"
 #include "xr_hand_mix_spv.h"
 #include "xr_hand_vs_spv.h"
 #include "xr_hud_spv.h"
 int vk_dlaa_vr_planes(float planes[2]);                     // vk_dlaa.h
 void rec_drain(void);                                        // vk_rec.h
+void gfx_fit_rect(int cw, int ch, int dw, int dh, int out[4]);   // vk.h
 }
 
 namespace {
@@ -211,6 +214,18 @@ struct Xr {
     uint32_t hand_w = 0, hand_h = 0;
     VkSampler hand_sampler = VK_NULL_HANDLE;
     bool hand_tried = false;
+    // the hands on the desktop: an overlay of them from the head (hud_mu) blended onto the window (hands_onto_window)
+    VkImage win_overlay = VK_NULL_HANDLE;
+    VkImageView win_overlay_view = VK_NULL_HANDLE;
+    uint32_t win_overlay_w = 0, win_overlay_h = 0;
+    bool win_hands = false;   // the overlay holds hands this present
+    VkDescriptorSetLayout blit_set = VK_NULL_HANDLE;
+    VkPipelineLayout blit_layout = VK_NULL_HANDLE;
+    VkPipeline blit_pipe = VK_NULL_HANDLE;
+    VkFormat blit_format = VK_FORMAT_UNDEFINED;
+    VkImage win_image[8]{};
+    VkImageView win_view[8]{};
+    int win_next = 0;
     // the aiming reticle (shaders/xr_aim.comp, hud_mu) drawn into scene8 where the aim lands
     VkDescriptorSetLayout aim_set = VK_NULL_HANDLE;
     VkPipelineLayout aim_layout = VK_NULL_HANDLE;
@@ -1027,22 +1042,32 @@ Mat4 held(int item, int right_hand, const VrModel &m, const char *name) {
     return r;
 }
 
-// (vk_xr_capture, hud_mu held, after make_panel, before make_eyes) the sword and shield equipped drawn at the hands while
-// Link holds them out, with Play style Motion and the Touch controllers
-void make_hands(VkCommandBuffer cb, const Drawn &d) {
-    Xr &x = xr();
-    float planes[2];
-    if (!d.tracked || strcmp(cfg_value("NX2NAVI_VR_PLAY"), "motion") || strcmp(cfg_value("NX2NAVI_VR_CONTROLS"), "meta") ||
-        !x.depth_kept || !vk_dlaa_vr_planes(planes))
-        return;
-    // the item in Link's hand in the sword's place, with the shield; else the sword and shield while they are out
+// VR's hands drawn (vk_xr_capture): the sword and shield equipped while Link holds them out, or the item in his hand,
+// with Play style Motion and the Touch controllers. Prepared once a present (hands_ready: the models, the pipelines,
+// the targets), then drawn from a pose (hands_draw: into hand_color and hand_dist at three quarters of the scene's
+// size) and put into a picture where nearer than the scene's kept depth (hands_mix): each eye's from that eye with
+// depth stereo, else the scene's from the head; and the desktop window's from the head (hands_onto_window).
+struct HandsFrame {
     Xr::HandItem *gear[3] = {};
+    Pose grips[2];
+    bool ok[2]{};
+    float planes[2]{};
+    bool two_handed = false;
+    int sword = 0;
+};
+
+bool hands_ready(VkCommandBuffer cb, const Drawn &d, HandsFrame &f) {
+    Xr &x = xr();
+    if (!d.tracked || strcmp(cfg_value("NX2NAVI_VR_PLAY"), "motion") || strcmp(cfg_value("NX2NAVI_VR_CONTROLS"), "meta") ||
+        !x.depth_kept || !vk_dlaa_vr_planes(f.planes))
+        return false;
+    // the item in Link's hand in the sword's place, with the shield; else the sword and shield while they are out
     {
         std::lock_guard<std::mutex> lk(x.gear_mu);
-        if (x.gear[2][0]) gear[2] = hand_item(x.gear[2]), gear[1] = hand_item(x.gear[1]);
-        else if (x.weapon_out.load()) gear[0] = hand_item(x.gear[0]), gear[1] = hand_item(x.gear[1]);
+        if (x.gear[2][0]) f.gear[2] = hand_item(x.gear[2]), f.gear[1] = hand_item(x.gear[1]);
+        else if (x.weapon_out.load()) f.gear[0] = hand_item(x.gear[0]), f.gear[1] = hand_item(x.gear[1]);
     }
-    if (!gear[0] && !gear[1] && !gear[2]) return;
+    if (!f.gear[0] && !f.gear[1] && !f.gear[2]) return false;
     if (!x.hand_tried) {
         x.hand_tried = true;
         if (!make_hand_pipelines()) {
@@ -1050,12 +1075,10 @@ void make_hands(VkCommandBuffer cb, const Drawn &d) {
             x.hand_pipe = x.mix_pipe = VK_NULL_HANDLE;
         }
     }
-    if (!x.hand_pipe || !x.mix_pipe) return;
-    Pose grips[2];
-    bool ok[2];
+    if (!x.hand_pipe || !x.mix_pipe) return false;
     {
         std::lock_guard<std::mutex> lk(x.hands_mu);
-        for (int h = 0; h < 2; h++) grips[h] = x.grip[h], ok[h] = x.grip_ok[h];
+        for (int h = 0; h < 2; h++) f.grips[h] = x.grip[h], f.ok[h] = x.grip_ok[h];
     }
     // the models drawn at three quarters of the scene's size (the card's memory is scarce), filtered up into it
     const uint32_t hw = std::max(1u, x.hud_w * 3 / 4), hh = std::max(1u, x.hud_h * 3 / 4);
@@ -1067,15 +1090,30 @@ void make_hands(VkCommandBuffer cb, const Drawn &d) {
                         x.hand_depth_view, VK_IMAGE_ASPECT_DEPTH_BIT)) {
             rt_log("vr: hands: targets %ux%u could not be made", hw, hh);
             x.hand_pipe = VK_NULL_HANDLE;
-            return;
+            return false;
         }
         x.hand_w = hw, x.hand_h = hh;
     }
-    for (auto *it : gear)
+    for (auto *it : f.gear)
         if (it && !it->uploaded && it->cpu.verts && !upload_item(cb, *it)) it->cpu.verts = nullptr;   // (not again)
-    const int sword = strcmp(cfg_value("NX2NAVI_VR_HANDEDNESS"), "right") == 0 ? 1 : 0;
-    // the head's view (the picture's pose) and its lens: clip = (x / tan_x, -y / tan_y, near, -z), the depth reversed
-    const Mat4 view = inverse_rigid(pose_matrix(d.pose));
+    f.sword = strcmp(cfg_value("NX2NAVI_VR_HANDEDNESS"), "right") == 0 ? 1 : 0;
+    // held in both hands (the Biggoron Sword, the bow, the slingshot, the hammer, a Deku Stick): no shield
+    f.two_handed = (f.gear[0] && strstr(f.gear[0]->name, "Biggoron")) ||
+                   (f.gear[2] && (strstr(f.gear[2]->name, "_Bow") || strstr(f.gear[2]->name, "SlingShot") ||
+                                  strstr(f.gear[2]->name, "Hammer") || strstr(f.gear[2]->name, "DekuStick")));
+    return true;
+}
+
+// the models drawn from the head's pose moved `side` metres along its right (an eye), with the picture's lens:
+// clip = (x / tan_x, -y / tan_y, near, -z), the depth reversed
+void hands_draw(VkCommandBuffer cb, const Drawn &d, const HandsFrame &f, float side) {
+    Xr &x = xr();
+    Pose eye = d.pose;
+    static const float right[3] = {1, 0, 0};
+    float r[3];
+    rotate(d.pose.q, right, r);
+    for (int c = 0; c < 3; c++) eye.p[c] += side * r[c];
+    const Mat4 view = inverse_rigid(pose_matrix(eye));
     const float tx = d.lens.r * d.scale, ty = d.lens.u * d.scale, near = 0.01f;
     Mat4 proj{};
     proj.m[0] = 1.0f / tx, proj.m[5] = -1.0f / ty, proj.m[11] = -1.0f, proj.m[14] = near;
@@ -1101,17 +1139,12 @@ void make_hands(VkCommandBuffer cb, const Drawn &d) {
     const VkRect2D sc{{0, 0}, {x.hand_w, x.hand_h}};
     vkCmdSetViewport(cb, 0, 1, &vp), vkCmdSetScissor(cb, 0, 1, &sc);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, x.hand_pipe);
-    // a sword held in both hands (the Biggoron Sword) leaves no shield out
-    // held in both hands (the Biggoron Sword, the bow, the slingshot, the hammer, a Deku Stick): no shield
-    const bool two_handed = (gear[0] && strstr(gear[0]->name, "Biggoron")) ||
-                            (gear[2] && (strstr(gear[2]->name, "_Bow") || strstr(gear[2]->name, "SlingShot") ||
-                                         strstr(gear[2]->name, "Hammer") || strstr(gear[2]->name, "DekuStick")));
     for (int i = 0; i < 3; i++) {
-        if (!gear[i] || (i == 1 && two_handed)) continue;
-        const Xr::HandItem &it = *gear[i];
-        const int hand = i == 1 ? 1 - sword : sword;
-        if (!it.uploaded || !ok[hand]) continue;
-        const Mat4 mv = mul(view, mul(pose_matrix(grips[hand]), held(i, hand == 1, it.cpu, it.name)));
+        if (!f.gear[i] || (i == 1 && f.two_handed)) continue;
+        const Xr::HandItem &it = *f.gear[i];
+        const int hand = i == 1 ? 1 - f.sword : f.sword;
+        if (!it.uploaded || !f.ok[hand]) continue;
+        const Mat4 mv = mul(view, mul(pose_matrix(f.grips[hand]), held(i, hand == 1, it.cpu, it.name)));
         const Mat4 clip = mul(proj, mv);
         float pc[32];
         std::memcpy(pc, clip.m, sizeof clip.m), std::memcpy(pc + 16, mv.m, sizeof mv.m);
@@ -1131,10 +1164,15 @@ void make_hands(VkCommandBuffer cb, const Drawn &d) {
     vkCmdEndRendering(cb);
     barrier(cb, x.hand_color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
     barrier(cb, x.hand_dist, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+}
+
+// the drawn models put into `target` (an RGBA8 storage image of the scene's size, in GENERAL) where nearer than the scene
+void hands_mix(VkCommandBuffer cb, const HandsFrame &f, VkImage target, VkImageView target_view) {
+    Xr &x = xr();
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.mix_pipe);
     const VkDescriptorImageInfo info[4] = {{x.hand_sampler, x.hand_color_view, VK_IMAGE_LAYOUT_GENERAL},
                                            {x.nearest, x.hand_dist_view, VK_IMAGE_LAYOUT_GENERAL},
-                                           {VK_NULL_HANDLE, x.scene8_view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, target_view, VK_IMAGE_LAYOUT_GENERAL},
                                            {VK_NULL_HANDLE, x.depth_view, VK_IMAGE_LAYOUT_GENERAL}};
     const VkDescriptorBufferInfo rows{x.rows, 0, 8ull * x.depth_h};
     VkWriteDescriptorSet w[5]{};
@@ -1147,11 +1185,146 @@ void make_hands(VkCommandBuffer cb, const Drawn &d) {
     }
     x.push_set(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.mix_layout, 0, 5, w);
     int32_t pc[6] = {(int32_t)x.hud_w, (int32_t)x.hud_h, (int32_t)x.depth_w, (int32_t)x.depth_h, 0, 0};
-    std::memcpy(&pc[4], &planes[0], 4), std::memcpy(&pc[5], &planes[1], 4);
+    std::memcpy(&pc[4], &f.planes[0], 4), std::memcpy(&pc[5], &f.planes[1], 4);
     vkCmdPushConstants(cb, x.mix_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
     vkCmdDispatch(cb, (x.hud_w + 7) / 8, (x.hud_h + 7) / 8, 1);
-    barrier(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
-    barrier(cb, x.depth, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    barrier(cb, target, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+}
+
+// (vk_xr_capture, hud_mu held, after make_eyes) the hands into the headset's pictures: each eye's from that eye (true
+// stereo for them, whatever depth stereo does to the world: the same eyes' distance it uses), else the scene's; and
+// into the desktop's overlay from the head, for hands_onto_window. Whether the overlay holds hands this present.
+bool make_hands(VkCommandBuffer cb, const Drawn &d) {
+    Xr &x = xr();
+    HandsFrame f;
+    if (!hands_ready(cb, d, f)) return false;
+    if (d.stereo) {
+        const float strength = 0.01f * (float)cfg_int("NX2NAVI_VR_DEPTH");
+        for (int e = 0; e < 2; e++) {
+            hands_draw(cb, d, f, (e ? 0.5f : -0.5f) * d.ipd * strength);
+            hands_mix(cb, f, x.eye8[e], x.eye8_view[e]);
+        }
+    } else {
+        hands_draw(cb, d, f, 0.0f);
+        hands_mix(cb, f, x.scene8, x.scene8_view);
+    }
+    // the desktop's overlay: the scene's size, clear but for the hands from the head
+    if (!x.win_overlay || x.win_overlay_w != x.hud_w || x.win_overlay_h != x.hud_h) {
+        const VkImageUsageFlags u = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (!make_image(x.hud_w, x.hud_h, VK_FORMAT_R8G8B8A8_UNORM, u, x.win_overlay, x.win_overlay_view)) {
+            x.win_overlay = VK_NULL_HANDLE;
+            return false;
+        }
+        x.win_overlay_w = x.hud_w, x.win_overlay_h = x.hud_h;
+    }
+    barrier(cb, x.win_overlay, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    const VkClearColorValue clear{};
+    const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cb, x.win_overlay, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &all);
+    barrier(cb, x.win_overlay, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    if (d.stereo) hands_draw(cb, d, f, 0.0f);
+    hands_mix(cb, f, x.win_overlay, x.win_overlay_view);
+    return true;
+}
+
+// The desktop's blend of the overlay onto the window (shaders/xr_hand_blit_vs.vert, xr_hand_blit_fs.frag), made for
+// the window's format
+bool make_blit_pipeline(VkFormat format) {
+    Xr &x = xr();
+    if (!x.blit_set) {
+        const VkDescriptorSetLayoutBinding b{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 1, li.pBindings = &b;
+        if (vkCreateDescriptorSetLayout(x.device, &li, nullptr, &x.blit_set) != VK_SUCCESS) return false;
+        const VkPushConstantRange pr{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(int32_t)};
+        VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pi.setLayoutCount = 1, pi.pSetLayouts = &x.blit_set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
+        if (vkCreatePipelineLayout(x.device, &pi, nullptr, &x.blit_layout) != VK_SUCCESS) return false;
+    }
+    const VkShaderModule vs = shader(xr_hand_blit_vs_spv, sizeof xr_hand_blit_vs_spv),
+                         fs = shader(xr_hand_blit_fs_spv, sizeof xr_hand_blit_fs_spv);
+    if (!vs || !fs) return false;
+    VkPipelineShaderStageCreateInfo st[2]{};
+    st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main", nullptr};
+    st[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main", nullptr};
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL, rs.cullMode = VK_CULL_MODE_NONE, rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.blendEnable = VK_TRUE, cba.colorWriteMask = 0x7;
+    cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba.colorBlendOp = VK_BLEND_OP_ADD;
+    cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO, cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE, cba.alphaBlendOp = VK_BLEND_OP_ADD;
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1, cb.pAttachments = &cba;
+    const VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dy.dynamicStateCount = 2, dy.pDynamicStates = dyn;
+    VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    ri.colorAttachmentCount = 1, ri.pColorAttachmentFormats = &format;
+    VkGraphicsPipelineCreateInfo gi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gi.pNext = &ri, gi.stageCount = 2, gi.pStages = st, gi.pVertexInputState = &vi, gi.pInputAssemblyState = &ia;
+    gi.pViewportState = &vp, gi.pRasterizationState = &rs, gi.pMultisampleState = &ms, gi.pDepthStencilState = &ds;
+    gi.pColorBlendState = &cb, gi.pDynamicState = &dy, gi.layout = x.blit_layout;
+    const VkResult r = vkCreateGraphicsPipelines(x.device, VK_NULL_HANDLE, 1, &gi, nullptr, &x.blit_pipe);
+    vkDestroyShaderModule(x.device, vs, nullptr), vkDestroyShaderModule(x.device, fs, nullptr);
+    x.blit_format = format;
+    return r == VK_SUCCESS;
+}
+
+// (vk_xr_capture, last, hud_mu held) the overlay's hands blended onto the window where the game's picture sits in it
+// (gfx_fit_rect, as the present placed it), so the desktop shows them too; the window back in TRANSFER_SRC after
+void hands_onto_window(VkCommandBuffer cb, VkImage window, VkExtent2D extent, VkFormat format, const int rect[4]) {
+    Xr &x = xr();
+    if (!x.win_overlay) return;
+    if (x.blit_format != format || !x.blit_pipe) {
+        x.blit_pipe = VK_NULL_HANDLE;
+        if (!make_blit_pipeline(format)) {
+            static bool told;
+            if (!told) rt_log("vr: hands: the desktop's blend could not be made"), told = true;
+            x.blit_format = format;
+            return;
+        }
+    }
+    VkImageView view = VK_NULL_HANDLE;   // the window's images' views, kept by image
+    for (int i = 0; i < 8 && !view; i++)
+        if (x.win_image[i] == window) view = x.win_view[i];
+    if (!view) {
+        VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vc.image = window, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = format, vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (vkCreateImageView(x.device, &vc, nullptr, &view) != VK_SUCCESS) return;
+        const int k = x.win_next++ % 8;   // (a view of an image long gone is left behind)
+        x.win_image[k] = window, x.win_view[k] = view;
+    }
+    int to[4];
+    gfx_fit_rect(rect[2], rect[3], (int)extent.width, (int)extent.height, to);
+    barrier(cb, window, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    ca.imageView = view, ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    ri.renderArea = {{0, 0}, extent}, ri.layerCount = 1, ri.colorAttachmentCount = 1, ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(cb, &ri);
+    const VkViewport vp{(float)to[0], (float)to[1], (float)to[2], (float)to[3], 0, 1};
+    const VkRect2D sc{{to[0], to[1]}, {(uint32_t)to[2], (uint32_t)to[3]}};
+    vkCmdSetViewport(cb, 0, 1, &vp), vkCmdSetScissor(cb, 0, 1, &sc);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, x.blit_pipe);
+    const VkDescriptorImageInfo ti{x.hand_sampler, x.win_overlay_view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstBinding = 0, w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, w.pImageInfo = &ti;
+    x.push_set(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, x.blit_layout, 0, 1, &w);
+    const int32_t srgb = is_srgb(format) ? 1 : 0;
+    vkCmdPushConstants(cb, x.blit_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof srgb, &srgb);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRendering(cb);
+    barrier(cb, window, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 }
 
 // (vk_xr_capture, hud_mu held, after make_panel) each eye's picture from the scene make_panel left in scene8 and this
@@ -2515,8 +2688,9 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
         const bool wheel = vk_xr_wheel(&wheel_slot) || plat_now_ns() - x.wheel_closed_at.load() < wheel_hide_ns;
         made = make_panel(cb, !panel && !wheel, d.aim && panel ? (int)(0.06f * (float)x.hud_h) : 0);
         hw = x.hud_w, hh = x.hud_h;
-        if (made) make_aim(cb, d), make_hands(cb, d);
+        if (made) make_aim(cb, d);
         if (made && depth) d.stereo = make_eyes(cb, d);
+        x.win_hands = made && make_hands(cb, d);
     }
     d.hud = made && panel;
     if (d.tracked && made) x.frozen = d;   // its world stays in scene8 and eye8 until the next one made
@@ -2556,6 +2730,10 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
     if (d.tracked) {
         overlay_onto_hud(cb, slot, window, extent, d);
         x.box_drawn[slot] = d;
+        if (x.win_hands && have_picture) {   // last: the headset's copies are made
+            std::lock_guard<std::mutex> lk(x.hud_mu);
+            hands_onto_window(cb, window, extent, format, rect);
+        }
     }
     x.pending = slot;
     signal->semaphore = x.timeline;
